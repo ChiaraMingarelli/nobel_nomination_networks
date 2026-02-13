@@ -1978,6 +1978,8 @@ def compute_burst_decomposition(combined_df: pd.DataFrame, precomputed: dict,
                 "total_noms": nominee_stats[nominee]["total_noms"],
                 "burst_noms": int(burst["n_nominations"]),
                 "n_burst_nominators": n_burst_nominators,
+                "diversity": 1,
+                "density": 0.0,
                 "connected_frac": 0.0,
                 "n_countries": 1,
                 "burst_type": "independent",
@@ -2000,6 +2002,26 @@ def compute_burst_decomposition(combined_df: pd.DataFrame, precomputed: dict,
         connected_count = sum(1 for n in burst_nominators if co_activity.degree(n) > 0)
         connected_frac = connected_count / n_burst_nominators
 
+        # Density of the co-activity subgraph
+        n_nodes = co_activity.number_of_nodes()
+        n_edges = co_activity.number_of_edges()
+        max_edges = n_nodes * (n_nodes - 1) / 2 if n_nodes > 1 else 1
+        density = n_edges / max_edges if max_edges > 0 else 0
+
+        # Diversity: Louvain communities in the co-activity subgraph
+        if n_edges > 0 and n_nodes > 2:
+            try:
+                from networkx.algorithms.community import louvain_communities
+                comms = louvain_communities(co_activity, seed=42)
+                diversity = len(comms)
+            except Exception:
+                diversity = 1
+        elif n_edges == 0:
+            # No connections — each nominator is independent
+            diversity = n_nodes
+        else:
+            diversity = max(1, n_nodes)
+
         # Country diversity among burst nominators
         if "nominator_country" in burst_noms_df.columns:
             countries = burst_noms_df["nominator_country"].dropna().unique()
@@ -2021,6 +2043,8 @@ def compute_burst_decomposition(combined_df: pd.DataFrame, precomputed: dict,
             "total_noms": nominee_stats[nominee]["total_noms"],
             "burst_noms": int(burst["n_nominations"]),
             "n_burst_nominators": n_burst_nominators,
+            "diversity": diversity,
+            "density": round(density, 4),
             "connected_frac": round(connected_frac, 3),
             "n_countries": n_countries,
             "burst_type": burst_type,
@@ -2146,6 +2170,7 @@ def compute_centrality_prediction(combined_df: pd.DataFrame, precomputed: dict) 
     Builds cumulative directed nomination graphs at 5-year snapshots. For each
     nominee, computes structural features matching the paper's model:
       - in_degree: weighted in-degree (number of nominations)
+      - pagerank: PageRank in the directed nomination graph
       - breadth: number of unique nominators
       - diversity: Louvain communities among nominator co-activity subgraph
       - reach: mean degree of nominators
@@ -2154,7 +2179,7 @@ def compute_centrality_prediction(combined_df: pd.DataFrame, precomputed: dict) 
     Compares three logistic regression models via leave-one-snapshot-out CV:
       1. in_degree_only: just weighted in-degree (baseline)
       2. structural: breadth, diversity, reach, concentration
-      3. full: in_degree + all structural features
+      3. full: in_degree + pagerank + all structural features
 
     Returns dict with per-model AUC, coefficients, feature table, and ROC data.
     """
@@ -2171,32 +2196,24 @@ def compute_centrality_prediction(combined_df: pd.DataFrame, precomputed: dict) 
     snapshot_years = list(range(1910, 1970, 5))
     all_observations = []
 
-    # Build cumulative graph incrementally
-    G = nx.DiGraph()
-    edges_by_year = df.groupby("year")
-    all_years = sorted(df["year"].unique())
-    frontier = 0
-
-    # Also track cumulative nominator->nominees mapping for structural features
-    cumulative_nominator_to_nominees = defaultdict(set)
-    cumulative_nominee_to_nominators = defaultdict(lambda: defaultdict(int))
-    cum_frontier = 0
-
     for snap_year in snapshot_years:
-        # Add edges from frontier up to snap_year
-        while frontier < len(all_years) and all_years[frontier] <= snap_year:
-            yr = all_years[frontier]
-            if yr in edges_by_year.groups:
-                year_df = edges_by_year.get_group(yr)
-                for row in year_df.itertuples(index=False):
-                    n1, n2 = row.nominator_name, row.nominee_name
-                    if G.has_edge(n1, n2):
-                        G[n1][n2]["weight"] += 1
-                    else:
-                        G.add_edge(n1, n2, weight=1)
-                    cumulative_nominator_to_nominees[n1].add(n2)
-                    cumulative_nominee_to_nominators[n2][n1] += 1
-            frontier += 1
+        snap_df = df[df["year"] <= snap_year]
+        if len(snap_df) < 50:
+            continue
+
+        # Per-nominee nominator stats
+        snap_nom_stats = defaultdict(lambda: defaultdict(int))
+        for row in snap_df.itertuples(index=False):
+            snap_nom_stats[row.nominee_name][row.nominator_name] += 1
+
+        # Build nomination graph
+        G = nx.DiGraph()
+        for row in snap_df.itertuples(index=False):
+            n1, n2 = row.nominator_name, row.nominee_name
+            if G.has_edge(n1, n2):
+                G[n1][n2]["weight"] += 1
+            else:
+                G.add_edge(n1, n2, weight=1)
 
         if G.number_of_nodes() < 10:
             continue
@@ -2208,24 +2225,25 @@ def compute_centrality_prediction(combined_df: pd.DataFrame, precomputed: dict) 
         # Weighted in-degree
         in_degrees = dict(G.in_degree(weight="weight"))
 
-        # Build nominator co-activity graph for this snapshot
-        # Two nominators linked if they share at least one nominee
-        nominator_coact = nx.Graph()
-        nominee_to_nors = defaultdict(set)
-        for nominator, nominees in cumulative_nominator_to_nominees.items():
-            for nom in nominees:
-                nominee_to_nors[nom].add(nominator)
+        # PageRank
+        try:
+            pagerank = nx.pagerank(G, weight="weight", max_iter=100)
+        except nx.PowerIterationFailedConvergence:
+            pagerank = {n: 1.0 / max(1, G.number_of_nodes()) for n in G.nodes}
 
-        coact_edges = defaultdict(int)
-        for nom, nominators in nominee_to_nors.items():
-            nominators_list = sorted(nominators)
-            if len(nominators_list) > 50:
-                continue  # skip institutional
-            for i in range(len(nominators_list)):
-                for j in range(i + 1, len(nominators_list)):
-                    coact_edges[(nominators_list[i], nominators_list[j])] += 1
-        for (n1, n2), w in coact_edges.items():
-            nominator_coact.add_edge(n1, n2, weight=w)
+        # Build nominator co-activity: two nominators linked if they nominated
+        # any of the same people. Built from nominee→nominators mapping.
+        snap_nominee_to_nors = defaultdict(set)
+        for row in snap_df.itertuples(index=False):
+            snap_nominee_to_nors[row.nominee_name].add(row.nominator_name)
+
+        nom_shared = defaultdict(lambda: defaultdict(int))
+        for nom, nors in snap_nominee_to_nors.items():
+            nors_l = sorted(nors)
+            for i in range(len(nors_l)):
+                for j in range(i + 1, len(nors_l)):
+                    nom_shared[nors_l[i]][nors_l[j]] += 1
+                    nom_shared[nors_l[j]][nors_l[i]] += 1
 
         for nominee in nominees_in_graph:
             # Label: won within 10 years after snapshot?
@@ -2235,46 +2253,49 @@ def compute_centrality_prediction(combined_df: pd.DataFrame, precomputed: dict) 
                 won = 1
 
             # Structural features
-            nom_counts = cumulative_nominee_to_nominators[nominee]
-            total_noms = sum(nom_counts.values())
-            breadth = len(nom_counts)
+            nc = snap_nom_stats[nominee]
+            total_noms = sum(nc.values())
+            breadth = len(nc)
 
             # Reach: mean degree of nominators in the full graph
-            nominator_degrees = []
-            for nominator in nom_counts:
-                if nominator in G:
-                    nominator_degrees.append(G.degree(nominator, weight="weight"))
-            reach = float(np.mean(nominator_degrees)) if nominator_degrees else 0.0
+            nom_degs = [G.degree(n, weight="weight") for n in nc if n in G]
+            reach = float(np.mean(nom_degs)) if nom_degs else 0.0
 
             # Concentration: Herfindahl index
             if total_noms > 0:
-                shares = [c / total_noms for c in nom_counts.values()]
+                shares = [c / total_noms for c in nc.values()]
                 concentration = sum(s ** 2 for s in shares)
             else:
                 concentration = 1.0
 
             # Diversity: Louvain communities among this nominee's nominators
-            # in the co-activity graph (excluding the nominee from links)
-            nominator_set = set(nom_counts.keys())
-            nominator_subgraph_nodes = [n for n in nominator_set if n in nominator_coact]
-            if len(nominator_subgraph_nodes) > 2:
-                sub = nominator_coact.subgraph(nominator_subgraph_nodes)
-                if sub.number_of_edges() > 0:
+            noms_list = list(nc.keys())
+            if len(noms_list) > 2:
+                sub_g = nx.Graph()
+                for n in noms_list:
+                    sub_g.add_node(n)
+                for i, n1 in enumerate(noms_list):
+                    for n2 in noms_list[i + 1:]:
+                        w = nom_shared.get(n1, {}).get(n2, 0)
+                        if w > 0:
+                            sub_g.add_edge(n1, n2, weight=w)
+                if sub_g.number_of_edges() > 0:
                     try:
                         from networkx.algorithms.community import louvain_communities
-                        communities = louvain_communities(sub, seed=42)
+                        communities = louvain_communities(sub_g, seed=42)
                         diversity = len(communities)
                     except Exception:
-                        diversity = len(nominator_subgraph_nodes)
+                        diversity = len(noms_list)
                 else:
-                    diversity = len(nominator_subgraph_nodes)
+                    diversity = len(noms_list)
             else:
-                diversity = max(len(nominator_subgraph_nodes), len(nominator_set))
+                diversity = max(1, len(noms_list))
 
             all_observations.append({
                 "snapshot": snap_year,
                 "nominee": nominee,
                 "in_degree": in_degrees.get(nominee, 0),
+                "pagerank": pagerank.get(nominee, 0),
                 "breadth": breadth,
                 "diversity": diversity,
                 "reach": round(reach, 2),
@@ -2287,10 +2308,10 @@ def compute_centrality_prediction(combined_df: pd.DataFrame, precomputed: dict) 
 
     feature_table = pd.DataFrame(all_observations)
 
-    # Three model feature sets
+    # Three model feature sets (matching the paper)
     in_degree_features = ["in_degree"]
     structural_features = ["breadth", "diversity", "reach", "concentration"]
-    full_features = ["in_degree", "breadth", "diversity", "reach", "concentration"]
+    full_features = ["in_degree", "pagerank", "breadth", "diversity", "reach", "concentration"]
 
     # --- Leave-one-snapshot-out CV ---
     snapshots_present = sorted(feature_table["snapshot"].unique())
@@ -2347,11 +2368,12 @@ def compute_centrality_prediction(combined_df: pd.DataFrame, precomputed: dict) 
     if not auc_scores["in_degree_only"]:
         return {"error": "No valid CV folds (each snapshot needs both winners and non-winners)"}
 
-    # Pooled ROC curves
+    # Pooled ROC curves — use pooled AUC (matching the paper's method)
     roc_data = {}
     model_results = {}
     for name, feats in model_configs.items():
         fpr_pooled, tpr_pooled, _ = roc_curve(y_true_all, y_scores[name])
+        pooled_auc = float(auc(fpr_pooled, tpr_pooled))
         mean_auc = float(np.mean(auc_scores[name]))
         roc_data[name] = {
             "fpr": fpr_pooled.tolist(),
@@ -2367,7 +2389,8 @@ def compute_centrality_prediction(combined_df: pd.DataFrame, precomputed: dict) 
         coefficients = dict(zip(feats, final_model.coef_[0].tolist()))
 
         model_results[name] = {
-            "auc": round(mean_auc, 4),
+            "auc": round(pooled_auc, 4),
+            "auc_mean": round(mean_auc, 4),
             "coefficients": {k: round(v, 4) for k, v in coefficients.items()},
         }
 
@@ -2982,12 +3005,58 @@ def _render_advanced_analyses(combined_df, cat_combined, precomputed, flags):
                 if stats_parts:
                     st.caption(". ".join(stats_parts) + ".")
 
+                # Diversity vs win rate chart (Fig 5 from paper)
+                bt = result["burst_table"]
+                if "diversity" in bt.columns:
+                    st.markdown("#### Win Rate by Nominator Diversity")
+                    st.caption(
+                        "Number of Louvain communities among burst nominators' "
+                        "co-activity subgraph (excluding shared nominee). More "
+                        "communities = more independent sources of support."
+                    )
+                    ORANGE = "#CC5500"
+                    BLUE = "#0055CC"
+                    div_bins = [(1, 1), (2, 2), (3, 3), (4, 4), (5, 999)]
+                    div_labels = ["1", "2", "3", "4", "5+"]
+                    div_data = []
+                    for (lo, hi), label in zip(div_bins, div_labels):
+                        sub = bt[(bt["diversity"] >= lo) & (bt["diversity"] <= hi)]
+                        div_data.append({
+                            "label": label,
+                            "n": len(sub),
+                            "rate": float(sub["won"].mean() * 100) if len(sub) > 0 else 0,
+                            "won": int(sub["won"].sum()),
+                        })
+                    dd = pd.DataFrame(div_data)
+
+                    fig_div, ax_div = plt.subplots(figsize=(5.5, 3.5))
+                    bar_colors = [ORANGE if l in ("1", "2") else BLUE
+                                  for l in dd["label"]]
+                    ax_div.bar(range(len(dd)), dd["rate"], color=bar_colors,
+                               alpha=0.85, edgecolor="white")
+                    for i, (n, won) in enumerate(zip(dd["n"], dd["won"])):
+                        ax_div.text(i, dd["rate"].iloc[i] + 1.5,
+                                    f"{won}/{n}", ha="center", fontsize=8)
+                    ax_div.set_xticks(range(len(dd)))
+                    ax_div.set_xticklabels(div_labels)
+                    ax_div.set_xlabel("Nominator communities in burst\n"
+                                      "(excluding shared nominee)")
+                    ax_div.set_ylabel("Win rate (%)")
+                    ax_div.spines["top"].set_visible(False)
+                    ax_div.spines["right"].set_visible(False)
+                    fig_div.tight_layout()
+                    st.pyplot(fig_div)
+                    _fig_download_buttons(fig_div, "diversity_winrate",
+                                          "diversity_winrate")
+                    plt.close(fig_div)
+
                 # Top burst nominees table
                 st.markdown("#### Top Burst Nominees")
-                bt = result["burst_table"]
                 display_cols = ["nominee", "won", "total_noms", "burst_noms",
-                                "n_burst_nominators", "connected_frac",
-                                "n_countries", "burst_type"]
+                                "n_burst_nominators", "diversity", "density",
+                                "connected_frac", "n_countries", "burst_type"]
+                # Only include columns that exist
+                display_cols = [c for c in display_cols if c in bt.columns]
                 st.dataframe(bt[display_cols].head(30), hide_index=True)
                 _csv_download_button(bt, "burst_decomposition.csv",
                                      key="burst_decomp_csv")
