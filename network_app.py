@@ -462,8 +462,6 @@ def main():
     has_cache = cached_df is not None
 
     if has_cache:
-        st.sidebar.success(f"Cached data: {len(cached_df)} edges")
-
         # Filter cached data to selected year range
         df = cached_df[
             (cached_df["year"] >= year_range[0])
@@ -473,10 +471,6 @@ def main():
         # Enrich with country data if columns are missing
         if "nominee_country" not in df.columns:
             df = enrich_with_country(df, precomputed)
-
-        if st.sidebar.button("Rebuild data (re-scrape)"):
-            _build_data(category, year_range[0], year_range[1], precomputed)
-            st.rerun()
 
     else:
         st.sidebar.warning("No cached data for this category.")
@@ -502,6 +496,12 @@ def main():
 
     # --- Main content: render network page ---
     render_network_page(df, precomputed=precomputed, combined_df=combined_df)
+
+    # --- Re-scrape at very bottom of sidebar ---
+    st.sidebar.divider()
+    if st.sidebar.button("Rebuild data (re-scrape)"):
+        _build_data(category, year_range[0], year_range[1], precomputed)
+        st.rerun()
 
 
 def _build_data(category: str, year_from: int, year_to: int, precomputed: dict):

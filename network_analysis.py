@@ -478,12 +478,26 @@ def render_network_page(df: pd.DataFrame, precomputed: dict | None = None,
         else:
             st.info("No edges meet the current filter criteria.")
 
-    # Campaign detection (optional section)
-    with st.expander("Campaign Detection"):
-        min_noms = st.slider("Minimum nominations for campaign", 3, 15, 5, key="campaign_min")
-        window = st.slider("Year window", 1, 5, 3, key="campaign_window")
+    # --- Sidebar: Analysis options ---
+    st.sidebar.divider()
+    st.sidebar.header("Analyses")
+
+    show_campaigns = st.sidebar.checkbox("Campaign Detection", key="show_campaigns")
+    if show_campaigns:
+        min_noms = st.sidebar.slider("Min nominations", 3, 15, 5, key="campaign_min")
+        campaign_window = st.sidebar.slider("Year window", 1, 5, 3, key="campaign_window")
+
+    show_paper = has_precomputed and st.sidebar.checkbox(
+        "Paper Analyses (Gallotti & De Domenico)", key="show_paper",
+    )
+    show_raw = st.sidebar.checkbox("Raw Edge Data", key="show_raw")
+
+    # --- Main area: render selected analyses ---
+
+    if show_campaigns:
+        st.subheader("Campaign Detection")
         if st.button("Detect campaigns"):
-            campaigns = detect_campaigns(df, min_nominations=min_noms, year_window=window)
+            campaigns = detect_campaigns(df, min_nominations=min_noms, year_window=campaign_window)
             if len(campaigns) > 0:
                 display_cols = ["nominee", "year_start", "year_end",
                                 "n_nominations", "n_unique_nominators"]
@@ -495,95 +509,90 @@ def render_network_page(df: pd.DataFrame, precomputed: dict | None = None,
             else:
                 st.info("No campaigns detected with current thresholds.")
 
-    # Paper analyses (inspired by Gallotti & De Domenico, 2019)
-    if has_precomputed:
-        with st.expander("Paper Analyses (Gallotti & De Domenico, 2019)"):
-            st.markdown(
-                "Analyses inspired by *Effects of homophily and academic reputation "
-                "in the nomination and selection of Nobel laureates* "
-                "(Gallotti & De Domenico, 2019)."
-            )
+    if show_paper:
+        st.subheader("Paper Analyses (Gallotti & De Domenico, 2019)")
+        st.caption(
+            "Inspired by *Effects of homophily and academic reputation "
+            "in the nomination and selection of Nobel laureates*."
+        )
 
-            # --- Analysis 1: Endorsement Effect ---
-            st.subheader("Laureate Endorsement Effect")
-            st.caption(
-                "Do nominees endorsed by past laureates win at higher rates?"
-            )
-            analysis_df = combined_df if has_combined else df
-            effect = compute_endorsement_effect(analysis_df, precomputed)
+        # --- Endorsement Effect ---
+        st.markdown("#### Laureate Endorsement Effect")
+        st.caption("Do nominees endorsed by past laureates win at higher rates?")
+        analysis_df = combined_df if has_combined else df
+        effect = compute_endorsement_effect(analysis_df, precomputed)
 
-            col1, col2, col3 = st.columns(3)
-            col1.metric(
-                "Endorsed win rate",
-                f"{effect['endorsed_rate']:.1%}",
-                help=f"{effect['endorsed_won']}/{effect['endorsed_total']} nominees endorsed by a past laureate went on to win",
-            )
-            col2.metric(
-                "Non-endorsed win rate",
-                f"{effect['not_endorsed_rate']:.1%}",
-                help=f"{effect['not_endorsed_won']}/{effect['not_endorsed_total']} nominees without laureate endorsement went on to win",
-            )
-            ratio_str = f"{effect['ratio']:.1f}x" if effect['ratio'] != float("inf") else "N/A"
-            col3.metric("Ratio", ratio_str)
+        col1, col2, col3 = st.columns(3)
+        col1.metric(
+            "Endorsed win rate",
+            f"{effect['endorsed_rate']:.1%}",
+            help=f"{effect['endorsed_won']}/{effect['endorsed_total']} nominees endorsed by a past laureate went on to win",
+        )
+        col2.metric(
+            "Non-endorsed win rate",
+            f"{effect['not_endorsed_rate']:.1%}",
+            help=f"{effect['not_endorsed_won']}/{effect['not_endorsed_total']} nominees without laureate endorsement went on to win",
+        )
+        ratio_str = f"{effect['ratio']:.1f}x" if effect['ratio'] != float("inf") else "N/A"
+        col3.metric("Ratio", ratio_str)
 
-            # Bar chart
-            import matplotlib.pyplot as plt
-            fig, ax = plt.subplots(figsize=(5, 3))
-            bars = ax.bar(
-                ["Endorsed\nby laureate", "Not endorsed"],
-                [effect["endorsed_rate"] * 100, effect["not_endorsed_rate"] * 100],
-                color=["#FFD700", "#999999"],
-                edgecolor="black",
-            )
-            ax.set_ylabel("Win rate (%)")
-            ax.set_title("Laureate endorsement effect")
-            for bar, rate in zip(bars, [effect["endorsed_rate"], effect["not_endorsed_rate"]]):
-                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
-                        f"{rate:.1%}", ha="center", va="bottom", fontsize=10)
-            fig.tight_layout()
-            st.pyplot(fig)
-            _fig_download_buttons(fig, "endorsement_effect", "endorsement")
-            plt.close(fig)
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(figsize=(5, 3))
+        bars = ax.bar(
+            ["Endorsed\nby laureate", "Not endorsed"],
+            [effect["endorsed_rate"] * 100, effect["not_endorsed_rate"] * 100],
+            color=["#FFD700", "#999999"],
+            edgecolor="black",
+        )
+        ax.set_ylabel("Win rate (%)")
+        ax.set_title("Laureate endorsement effect")
+        for bar, rate in zip(bars, [effect["endorsed_rate"], effect["not_endorsed_rate"]]):
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
+                    f"{rate:.1%}", ha="center", va="bottom", fontsize=10)
+        fig.tight_layout()
+        st.pyplot(fig)
+        _fig_download_buttons(fig, "endorsement_effect", "endorsement")
+        plt.close(fig)
 
-            # --- Analysis 3: Laureates in LCC ---
-            st.subheader("Laureates in Largest Connected Component")
-            st.caption(
-                "Are laureates over-represented in the LCC? "
-                "Null model: 1000 random permutations of laureate labels."
-            )
-            if st.button("Run LCC Analysis", key="lcc_btn"):
-                with st.spinner("Building combined graph and running permutation test..."):
-                    if has_combined:
-                        G_combined = build_combined_nomination_graph(combined_df, precomputed)
-                    else:
-                        G_combined = build_combined_nomination_graph(df, precomputed)
-                    lcc_result = compute_lcc_analysis(G_combined, precomputed)
-
-                if "error" in lcc_result:
-                    st.error(lcc_result["error"])
+        # --- Laureates in LCC ---
+        st.markdown("#### Laureates in Largest Connected Component")
+        st.caption(
+            "Are laureates over-represented in the LCC? "
+            "Null model: 1000 random permutations of laureate labels."
+        )
+        if st.button("Run LCC Analysis", key="lcc_btn"):
+            with st.spinner("Building combined graph and running permutation test..."):
+                if has_combined:
+                    G_combined = build_combined_nomination_graph(combined_df, precomputed)
                 else:
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric(
-                        "Observed laureates in LCC",
-                        lcc_result["observed"],
-                        help=f"Out of {lcc_result['n_laureates']} total laureates",
-                    )
-                    c2.metric(
-                        "Expected (null model)",
-                        f"{lcc_result['expected_mean']} +/- {lcc_result['expected_std']}",
-                    )
-                    c3.metric(
-                        "Z-score",
-                        lcc_result["z_score"],
-                        help=f"p = {lcc_result['p_value']:.2e}",
-                    )
-                    st.caption(
-                        f"LCC size: {lcc_result['lcc_size']} / {lcc_result['graph_size']} nodes. "
-                        f"Total laureates: {lcc_result['n_laureates']}."
-                    )
+                    G_combined = build_combined_nomination_graph(df, precomputed)
+                lcc_result = compute_lcc_analysis(G_combined, precomputed)
 
-    # Raw data table
-    with st.expander("Raw Edge Data"):
+            if "error" in lcc_result:
+                st.error(lcc_result["error"])
+            else:
+                c1, c2, c3 = st.columns(3)
+                c1.metric(
+                    "Observed laureates in LCC",
+                    lcc_result["observed"],
+                    help=f"Out of {lcc_result['n_laureates']} total laureates",
+                )
+                c2.metric(
+                    "Expected (null model)",
+                    f"{lcc_result['expected_mean']} +/- {lcc_result['expected_std']}",
+                )
+                c3.metric(
+                    "Z-score",
+                    lcc_result["z_score"],
+                    help=f"p = {lcc_result['p_value']:.2e}",
+                )
+                st.caption(
+                    f"LCC size: {lcc_result['lcc_size']} / {lcc_result['graph_size']} nodes. "
+                    f"Total laureates: {lcc_result['n_laureates']}."
+                )
+
+    if show_raw:
+        st.subheader("Raw Edge Data")
         st.dataframe(df, hide_index=True)
         _csv_download_button(df, "nomination_edges.csv", key="raw_edges_csv")
 
