@@ -534,6 +534,8 @@ def render_network_page(df: pd.DataFrame, precomputed: dict | None = None,
         )
         ax.set_ylabel("Win rate (%)")
         ax.set_title("Laureate endorsement effect")
+        max_val = max(effect["endorsed_rate"], effect["not_endorsed_rate"]) * 100
+        ax.set_ylim(0, max_val * 1.2)
         for bar, rate in zip(bars, [effect["endorsed_rate"], effect["not_endorsed_rate"]]):
             ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
                     f"{rate:.1%}", ha="center", va="bottom", fontsize=10)
