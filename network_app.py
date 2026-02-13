@@ -538,14 +538,32 @@ def main():
     )
 
     col_from, col_to = st.sidebar.columns(2)
-    year_from = col_from.number_input("Year from", min_value=1901, max_value=1974, value=1925)
-    year_to = col_to.number_input("Year to", min_value=1901, max_value=1974, value=1950)
+    year_from = col_from.number_input("Year from", min_value=1901, max_value=1974, value=1925,
+                                      key="year_from_input")
+    year_to = col_to.number_input("Year to", min_value=1901, max_value=1974, value=1950,
+                                  key="year_to_input")
     if year_from > year_to:
         year_from, year_to = year_to, year_from
-    year_range = (year_from, year_to)
+
+    # Only apply year range when user clicks Go (or on first run)
+    if "applied_years" not in st.session_state:
+        st.session_state.applied_years = (year_from, year_to)
+        st.session_state.applied_category = category
+
+    pending_change = (
+        (year_from, year_to) != st.session_state.applied_years
+        or category != st.session_state.applied_category
+    )
+    go_clicked = st.sidebar.button("Go!", type="primary", disabled=not pending_change)
+    if go_clicked:
+        st.session_state.applied_years = (year_from, year_to)
+        st.session_state.applied_category = category
+
+    year_range = st.session_state.applied_years
+    active_category = st.session_state.applied_category
 
     # Check for cached data
-    cached_df, cache_meta = load_cached_edges(category)
+    cached_df, cache_meta = load_cached_edges(active_category)
     has_cache = cached_df is not None
 
     if has_cache:
@@ -562,7 +580,7 @@ def main():
 
         # Filter cached data to selected category and year range
         df = cached_df[
-            (cached_df["category"] == category)
+            (cached_df["category"] == active_category)
             & (cached_df["year"] >= year_range[0])
             & (cached_df["year"] <= year_range[1])
         ].copy()
@@ -580,7 +598,7 @@ def main():
             f"Estimated time: {n_years * 0.5 + 50:.0f}s – {n_years * 1 + 200:.0f}s."
         )
         if st.sidebar.button("Build Network Data", type="primary"):
-            _build_data(category, year_range[0], year_range[1], precomputed)
+            _build_data(active_category, year_range[0], year_range[1], precomputed)
             st.rerun()
         else:
             st.info(
@@ -595,12 +613,12 @@ def main():
 
     # --- Main content: render network page ---
     render_network_page(df, precomputed=precomputed, combined_df=combined_df,
-                        category=category)
+                        category=active_category)
 
     # --- Re-scrape at very bottom of sidebar ---
     st.sidebar.divider()
     if st.sidebar.button("Rebuild data (re-scrape)"):
-        _build_data(category, year_range[0], year_range[1], precomputed)
+        _build_data(active_category, year_range[0], year_range[1], precomputed)
         st.rerun()
 
 
