@@ -16,6 +16,7 @@ from pyvis.network import Network
 from collections import defaultdict
 import tempfile
 import os
+import io
 import math
 import random
 
@@ -484,9 +485,13 @@ def render_network_page(df: pd.DataFrame, precomputed: dict | None = None,
         if st.button("Detect campaigns"):
             campaigns = detect_campaigns(df, min_nominations=min_noms, year_window=window)
             if len(campaigns) > 0:
-                st.dataframe(campaigns[["nominee", "year_start", "year_end",
-                                         "n_nominations", "n_unique_nominators"]],
-                             hide_index=True)
+                display_cols = ["nominee", "year_start", "year_end",
+                                "n_nominations", "n_unique_nominators"]
+                st.dataframe(campaigns[display_cols], hide_index=True)
+                _csv_download_button(
+                    campaigns[display_cols],
+                    "campaigns.csv", key="campaigns_csv",
+                )
             else:
                 st.info("No campaigns detected with current thresholds.")
 
@@ -537,6 +542,7 @@ def render_network_page(df: pd.DataFrame, precomputed: dict | None = None,
                         f"{rate:.1%}", ha="center", va="bottom", fontsize=10)
             fig.tight_layout()
             st.pyplot(fig)
+            _fig_download_buttons(fig, "endorsement_effect", "endorsement")
             plt.close(fig)
 
             # --- Analysis 3: Laureates in LCC ---
@@ -579,6 +585,7 @@ def render_network_page(df: pd.DataFrame, precomputed: dict | None = None,
     # Raw data table
     with st.expander("Raw Edge Data"):
         st.dataframe(df, hide_index=True)
+        _csv_download_button(df, "nomination_edges.csv", key="raw_edges_csv")
 
 
 # ---------------------------------------------------------------------------
@@ -623,6 +630,39 @@ def _filter(df, category=None, year_range=None, country=None):
     if country and "nominee_country" in filtered.columns:
         filtered = filtered[filtered["nominee_country"] == country]
     return filtered
+
+
+def _fig_download_buttons(fig, filename_stem: str, key_prefix: str):
+    """Render PDF and PNG download buttons for a matplotlib figure."""
+    col_pdf, col_png, _ = st.columns([1, 1, 3])
+    # PDF
+    buf_pdf = io.BytesIO()
+    try:
+        fig.savefig(buf_pdf, format="pdf", bbox_inches="tight")
+        col_pdf.download_button(
+            "Download PDF", buf_pdf.getvalue(),
+            file_name=f"{filename_stem}.pdf", mime="application/pdf",
+            key=f"{key_prefix}_pdf",
+        )
+    except ValueError:
+        # PDF backend not available — skip
+        pass
+    # PNG
+    buf_png = io.BytesIO()
+    fig.savefig(buf_png, format="png", dpi=200, bbox_inches="tight")
+    col_png.download_button(
+        "Download PNG", buf_png.getvalue(),
+        file_name=f"{filename_stem}.png", mime="image/png",
+        key=f"{key_prefix}_png",
+    )
+
+
+def _csv_download_button(dataframe: pd.DataFrame, filename: str, key: str,
+                         label: str = "Download CSV"):
+    """Render a CSV download button for a DataFrame."""
+    csv_data = dataframe.to_csv(index=False).encode("utf-8")
+    st.download_button(label, csv_data, file_name=filename,
+                       mime="text/csv", key=key)
 
 
 # ---------------------------------------------------------------------------
