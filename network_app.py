@@ -457,12 +457,12 @@ def main():
         list(CATEGORY_TO_PRIZE.keys()),
     )
 
-    year_range = st.sidebar.slider(
-        "Year range",
-        min_value=1901,
-        max_value=1974,
-        value=(1925, 1950),
-    )
+    col_from, col_to = st.sidebar.columns(2)
+    year_from = col_from.number_input("Year from", min_value=1901, max_value=1974, value=1925)
+    year_to = col_to.number_input("Year to", min_value=1901, max_value=1974, value=1950)
+    if year_from > year_to:
+        year_from, year_to = year_to, year_from
+    year_range = (year_from, year_to)
 
     # Check for cached data
     cached_df = load_cached_edges(category)
