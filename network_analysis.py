@@ -683,7 +683,7 @@ def render_network_page(df: pd.DataFrame, precomputed: dict | None = None,
         cs_window = st.sidebar.slider("Year window", 1, 5, 3, key="cs_window")
         run_campaign_success = st.sidebar.button("Run Campaign Success Analysis", key="cs_btn")
 
-    # --- Main area: Graph visualization ---
+    # --- Main area ---
     st.header("Nomination Networks")
 
     if network_type == "Nominator -> Nominee":
@@ -694,21 +694,11 @@ def render_network_page(df: pd.DataFrame, precomputed: dict | None = None,
         with st.spinner("Building cross-category combined network..."):
             G = _cached_build_graph(_df_hash(combined_df), combined_df, network_type, None, precomputed)
 
-    _render_graph_visualization(G, network_type, min_weight, is_cross_category)
+    has_adv = has_combined and adv_selection != "None"
 
-    # --- Main area: Analyses ---
-    if show_campaigns and run_campaigns:
-        _render_campaigns(df, min_noms, campaign_window)
-
-    if show_paper:
-        _render_paper_analyses(df, combined_df, precomputed, has_combined, run_lcc)
-
-    if show_raw:
-        st.subheader("Raw Edge Data")
-        st.dataframe(df, hide_index=True)
-        _csv_download_button(df, "nomination_edges.csv", key="raw_edges_csv")
-
-    if has_combined and adv_selection != "None":
+    if has_adv:
+        # Show advanced analysis instead of graph — no tabs (iframes cause
+        # white space in hidden tabs).
         adv_flags = {
             "show_centrality": show_centrality,
             "run_centrality": run_centrality,
@@ -724,9 +714,20 @@ def render_network_page(df: pd.DataFrame, precomputed: dict | None = None,
             "cs_min_noms": cs_min_noms,
             "cs_window": cs_window,
         }
-        st.divider()
-        st.header("Advanced Network Analyses")
         _render_advanced_analyses(combined_df, precomputed, adv_flags)
+    else:
+        _render_graph_visualization(G, network_type, min_weight, is_cross_category)
+
+        if show_campaigns and run_campaigns:
+            _render_campaigns(df, min_noms, campaign_window)
+
+        if show_paper:
+            _render_paper_analyses(df, combined_df, precomputed, has_combined, run_lcc)
+
+        if show_raw:
+            st.subheader("Raw Edge Data")
+            st.dataframe(df, hide_index=True)
+            _csv_download_button(df, "nomination_edges.csv", key="raw_edges_csv")
 
 
 # ---------------------------------------------------------------------------
@@ -2283,15 +2284,6 @@ def _render_advanced_analyses(combined_df, precomputed, flags):
                             bar.get_height() + max_rate * 0.03,
                             f"{rate:.1f}%", ha="center", va="bottom", fontsize=11,
                             fontweight="bold")
-                # Add significance annotation
-                p = result["p_value"]
-                if not np.isnan(p):
-                    sig_text = "n.s." if p >= 0.05 else (
-                        "*" if p >= 0.01 else ("**" if p >= 0.001 else "***"))
-                    ax.text(0.5, max_rate * 1.35,
-                            f"Fisher p = {p:.3f} ({sig_text})",
-                            ha="center", va="bottom", fontsize=10,
-                            transform=ax.get_xaxis_transform())
                 fig.tight_layout()
                 st.pyplot(fig)
                 _fig_download_buttons(fig, "campaign_success", "campaign_success")
@@ -2325,21 +2317,18 @@ def _render_advanced_analyses(combined_df, precomputed, flags):
                                     plot_df["control_rate"].values * 100,
                                     bar_w, color="#2ca02c", edgecolor="black",
                                     label="Control")
+                    # Build tick labels with sample sizes embedded
+                    tick_labels = [
+                        f"{r['nom_range']}\n(C:{int(r['campaign_n'])}, M:{int(r['control_n'])})"
+                        for _, r in plot_df.iterrows()
+                    ]
                     ax2.set_xticks(x_pos)
-                    ax2.set_xticklabels(plot_df["nom_range"].values)
-                    ax2.set_xlabel("Total lifetime nominations")
+                    ax2.set_xticklabels(tick_labels, fontsize=8)
+                    ax2.set_xlabel("Total lifetime nominations (C=campaign, M=matched)")
                     ax2.set_ylabel("Win rate (%)")
                     ax2.set_title(
                         "Campaign vs. Control Win Rate, Matched by Nomination Count")
                     ax2.legend()
-                    # Annotate sample sizes
-                    for i, (_, r) in enumerate(plot_df.iterrows()):
-                        ax2.text(i - bar_w / 2, -2.5,
-                                 f"n={int(r['campaign_n'])}", ha="center",
-                                 fontsize=7, color="#d62728")
-                        ax2.text(i + bar_w / 2, -2.5,
-                                 f"n={int(r['control_n'])}", ha="center",
-                                 fontsize=7, color="#2ca02c")
                     fig2.tight_layout()
                     st.pyplot(fig2)
                     _fig_download_buttons(fig2, "campaign_by_band", "campaign_band")
