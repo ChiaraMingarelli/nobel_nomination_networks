@@ -1610,33 +1610,39 @@ def compute_campaign_success(combined_df: pd.DataFrame, precomputed: dict,
     if raw_campaigns_df.empty:
         return {"error": "No campaigns detected with current thresholds."}
 
-    # Compute per-nominee annual nomination rates
+    # Compute per-nominee, per-year nomination counts for baseline calculation
     nominee_year_counts = combined_df.groupby(
         ["nominee_name", "year"]).size().reset_index(name="count")
-    nominee_annual_stats = nominee_year_counts.groupby("nominee_name")["count"].agg(
-        ["mean", "std", "count"]).rename(columns={"count": "n_years"})
-    # Fill NaN std (single-year nominees) with 0
-    nominee_annual_stats["std"] = nominee_annual_stats["std"].fillna(0)
 
     # Filter campaigns: keep only bursts where the window's annual rate
-    # exceeds mean + 2*std of the nominee's baseline, OR the nominee has
-    # too few years for a meaningful baseline (n_years <= 2).
+    # exceeds mean + 2*std of the nominee's *non-burst* baseline.
+    # Excluding burst window years from baseline avoids circular inflation
+    # of std (a large burst inflates the std computed from all years,
+    # making the threshold too high for nominees with one big spike).
     filtered_campaigns = []
     for _, row in raw_campaigns_df.iterrows():
         nominee = row["nominee"]
-        if nominee not in nominee_annual_stats.index:
+        nom_years = nominee_year_counts[nominee_year_counts["nominee_name"] == nominee]
+        if nom_years.empty:
             continue
-        stats = nominee_annual_stats.loc[nominee]
+
         window_years = row["year_end"] - row["year_start"] + 1
         window_annual_rate = row["n_nominations"] / window_years
 
-        # For nominees with few years, can't compute a meaningful baseline
-        if stats["n_years"] <= 2:
+        # Compute baseline excluding the burst window years
+        burst_year_set = set(range(int(row["year_start"]), int(row["year_end"]) + 1))
+        baseline = nom_years[~nom_years["year"].isin(burst_year_set)]["count"]
+
+        if len(baseline) <= 1:
+            # Too few non-burst years for a meaningful baseline — keep if
+            # the burst is at least the absolute threshold
             filtered_campaigns.append(row)
         else:
-            threshold = stats["mean"] + 2 * stats["std"]
-            # Also require at least 1.5x the mean to avoid flagging noise
-            threshold = max(threshold, stats["mean"] * 1.5)
+            base_mean = float(baseline.mean())
+            base_std = float(baseline.std())
+            threshold = base_mean + 2 * base_std
+            # Also require at least 1.5x the baseline mean
+            threshold = max(threshold, base_mean * 1.5)
             if window_annual_rate > threshold:
                 filtered_campaigns.append(row)
 
@@ -1664,11 +1670,14 @@ def compute_campaign_success(combined_df: pd.DataFrame, precomputed: dict,
             info = nominee_stats[name]
             person_campaigns = campaigns_df[campaigns_df["nominee"] == name]
             best = person_campaigns.sort_values("n_nominations", ascending=False).iloc[0]
-            # Include burst intensity info
-            stats = nominee_annual_stats.loc[name] if name in nominee_annual_stats.index else None
+            # Burst intensity
             window_years = best["year_end"] - best["year_start"] + 1
             window_rate = best["n_nominations"] / window_years
-            baseline_rate = stats["mean"] if stats is not None else 0
+            # Non-burst baseline rate (excluding burst window years)
+            nom_years = nominee_year_counts[nominee_year_counts["nominee_name"] == name]
+            burst_yr_set = set(range(int(best["year_start"]), int(best["year_end"]) + 1))
+            baseline = nom_years[~nom_years["year"].isin(burst_yr_set)]["count"]
+            baseline_rate = float(baseline.mean()) if len(baseline) > 0 else 0
             campaign_rows.append({
                 "name": name,
                 "total_noms": info["total_noms"],
@@ -1795,8 +1804,10 @@ def compute_campaign_success(combined_df: pd.DataFrame, precomputed: dict,
             denominator += var_a
         if denominator > 0:
             from scipy.stats import norm
-            cmh_stat = numerator ** 2 / denominator
-            cmh_p = 1.0 - norm.cdf(abs(numerator) / denominator ** 0.5)
+            # Continuity correction for small cell counts
+            corrected = max(0, abs(numerator) - 0.5)
+            cmh_stat = corrected ** 2 / denominator
+            cmh_p = 1.0 - norm.cdf(corrected / denominator ** 0.5)
             cmh_p = 2 * cmh_p  # two-sided
 
     # Mean total nominations for comparison
