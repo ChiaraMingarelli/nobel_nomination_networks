@@ -492,6 +492,9 @@ def render_network_page(df: pd.DataFrame, precomputed: dict | None = None,
     show_paper = has_precomputed and st.sidebar.checkbox(
         "Paper Analyses (Gallotti & De Domenico)", key="show_paper",
     )
+    run_lcc = False
+    if show_paper:
+        run_lcc = st.sidebar.button("Run LCC Analysis", key="lcc_btn")
     show_raw = st.sidebar.checkbox("Raw Edge Data", key="show_raw")
 
     # --- Main area: render selected analyses ---
@@ -555,42 +558,29 @@ def render_network_page(df: pd.DataFrame, precomputed: dict | None = None,
         _fig_download_buttons(fig, "endorsement_effect", "endorsement")
         plt.close(fig)
 
-        # --- Laureates in LCC ---
-        st.markdown("#### Laureates in Largest Connected Component")
-        st.caption(
-            "Are laureates over-represented in the LCC? "
-            "Null model: 1000 random permutations of laureate labels."
-        )
-        if st.button("Run LCC Analysis", key="lcc_btn"):
-            with st.spinner("Building combined graph and running permutation test..."):
-                if has_combined:
-                    G_combined = build_combined_nomination_graph(combined_df, precomputed)
-                else:
-                    G_combined = build_combined_nomination_graph(df, precomputed)
-                lcc_result = compute_lcc_analysis(G_combined, precomputed)
+        # --- Laureates in LCC (results in sidebar) ---
+        if run_lcc:
+            with st.sidebar:
+                with st.spinner("Running LCC permutation test..."):
+                    if has_combined:
+                        G_combined = build_combined_nomination_graph(combined_df, precomputed)
+                    else:
+                        G_combined = build_combined_nomination_graph(df, precomputed)
+                    lcc_result = compute_lcc_analysis(G_combined, precomputed)
 
-            if "error" in lcc_result:
-                st.error(lcc_result["error"])
-            else:
-                c1, c2, c3 = st.columns(3)
-                c1.metric(
-                    "Observed laureates in LCC",
-                    lcc_result["observed"],
-                    help=f"Out of {lcc_result['n_laureates']} total laureates",
-                )
-                c2.metric(
-                    "Expected (null model)",
-                    f"{lcc_result['expected_mean']} +/- {lcc_result['expected_std']}",
-                )
-                c3.metric(
-                    "Z-score",
-                    lcc_result["z_score"],
-                    help=f"p = {lcc_result['p_value']:.2e}",
-                )
-                st.caption(
-                    f"LCC size: {lcc_result['lcc_size']} / {lcc_result['graph_size']} nodes. "
-                    f"Total laureates: {lcc_result['n_laureates']}."
-                )
+                if "error" in lcc_result:
+                    st.error(lcc_result["error"])
+                else:
+                    st.markdown("**LCC Results**")
+                    st.metric("Observed in LCC", lcc_result["observed"],
+                              help=f"Out of {lcc_result['n_laureates']} laureates")
+                    st.metric("Expected (null)", f"{lcc_result['expected_mean']} +/- {lcc_result['expected_std']}")
+                    st.metric("Z-score", lcc_result["z_score"],
+                              help=f"p = {lcc_result['p_value']:.2e}")
+                    st.caption(
+                        f"LCC: {lcc_result['lcc_size']}/{lcc_result['graph_size']} nodes. "
+                        f"Laureates: {lcc_result['n_laureates']}."
+                    )
 
     if show_raw:
         st.subheader("Raw Edge Data")
