@@ -462,9 +462,10 @@ def main():
     has_cache = cached_df is not None
 
     if has_cache:
-        # Filter cached data to selected year range
+        # Filter cached data to selected category and year range
         df = cached_df[
-            (cached_df["year"] >= year_range[0])
+            (cached_df["category"] == category)
+            & (cached_df["year"] >= year_range[0])
             & (cached_df["year"] <= year_range[1])
         ].copy()
 
