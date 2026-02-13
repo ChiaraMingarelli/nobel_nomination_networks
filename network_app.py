@@ -454,7 +454,7 @@ def main():
         "Year range",
         min_value=1901,
         max_value=1974,
-        value=(1901, 1953),
+        value=(1925, 1950),
     )
 
     # Check for cached data
