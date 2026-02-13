@@ -594,7 +594,8 @@ def main():
         return
 
     # --- Main content: render network page ---
-    render_network_page(df, precomputed=precomputed, combined_df=combined_df)
+    render_network_page(df, precomputed=precomputed, combined_df=combined_df,
+                        category=category)
 
     # --- Re-scrape at very bottom of sidebar ---
     st.sidebar.divider()

@@ -575,10 +575,18 @@ def _render_paper_analyses(df, combined_df, precomputed, has_combined, run_lcc):
 
 
 def render_network_page(df: pd.DataFrame, precomputed: dict | None = None,
-                        combined_df: pd.DataFrame | None = None):
+                        combined_df: pd.DataFrame | None = None,
+                        category: str | None = None):
     """
     Full Streamlit page for network analysis.
     Category and year range are already filtered by the caller (sidebar).
+
+    Parameters
+    ----------
+    category : str or None
+        The selected prize category (e.g. "Physics").  When set, analyses
+        that operate on individual nominees filter combined_df to this
+        category so results match the sidebar selection.
 
     Delegates to helper functions for each section:
       _render_graph_visualization, _render_campaigns,
@@ -590,6 +598,13 @@ def render_network_page(df: pd.DataFrame, precomputed: dict | None = None,
 
     has_combined = combined_df is not None and not combined_df.empty
     has_precomputed = precomputed is not None and len(precomputed) > 0
+
+    # Category-filtered version for nominee-level analyses.
+    # Temporal Evolution and cross-category graph use the full combined_df.
+    if has_combined and category:
+        cat_combined = combined_df[combined_df["category"] == category].copy()
+    else:
+        cat_combined = combined_df
 
     # --- Sidebar: Network Controls ---
     st.sidebar.divider()
@@ -710,7 +725,7 @@ def render_network_page(df: pd.DataFrame, precomputed: dict | None = None,
         _render_campaigns(df, min_noms, campaign_window)
 
     if show_paper:
-        _render_paper_analyses(df, combined_df, precomputed, has_combined, run_lcc)
+        _render_paper_analyses(df, cat_combined, precomputed, has_combined, run_lcc)
 
     if show_raw:
         st.subheader("Raw Edge Data")
@@ -732,7 +747,7 @@ def render_network_page(df: pd.DataFrame, precomputed: dict | None = None,
         "cs_min_noms": cs_min_noms,
         "cs_window": cs_window,
     }
-    _render_advanced_analyses(combined_df, precomputed, adv_flags)
+    _render_advanced_analyses(combined_df, cat_combined, precomputed, adv_flags)
 
 
 # ---------------------------------------------------------------------------
@@ -2045,10 +2060,12 @@ def compute_centrality_prediction(combined_df: pd.DataFrame, precomputed: dict) 
 # RENDERING HELPER: ADVANCED ANALYSES
 # ---------------------------------------------------------------------------
 
-def _render_advanced_analyses(combined_df, precomputed, flags):
+def _render_advanced_analyses(combined_df, cat_combined, precomputed, flags):
     """
     Render all advanced analysis sections.
 
+    combined_df:  full cross-category data (for Temporal Evolution)
+    cat_combined: category-filtered data (for nominee-level analyses)
     flags: dict with keys like run_centrality, run_near_miss, run_temporal,
            run_proximity, near_miss_min, show_centrality, show_near_miss,
            show_temporal, show_proximity.
@@ -2181,7 +2198,7 @@ def _render_advanced_analyses(combined_df, precomputed, flags):
             )
         if flags.get("run_proximity"):
             with st.spinner("Computing proximity to laureates (BFS from each nominee)..."):
-                result = compute_proximity_effect(combined_df, precomputed)
+                result = compute_proximity_effect(cat_combined, precomputed)
 
             if "error" in result:
                 st.error(result["error"])
@@ -2269,7 +2286,7 @@ def _render_advanced_analyses(combined_df, precomputed, flags):
         if flags.get("run_near_miss"):
             min_noms = flags.get("near_miss_min", 10)
             with st.spinner(f"Analyzing near-misses (min {min_noms} nominations)..."):
-                result = compute_near_miss_analysis(combined_df, precomputed,
+                result = compute_near_miss_analysis(cat_combined, precomputed,
                                                     min_nominations=min_noms)
 
             col1, col2 = st.columns(2)
@@ -2357,7 +2374,7 @@ def _render_advanced_analyses(combined_df, precomputed, flags):
             cs_min = flags.get("cs_min_noms", 5)
             cs_win = flags.get("cs_window", 3)
             with st.spinner("Detecting campaigns and computing success rates..."):
-                result = compute_campaign_success(combined_df, precomputed,
+                result = compute_campaign_success(cat_combined, precomputed,
                                                   min_nominations=cs_min,
                                                   year_window=cs_win)
 
@@ -2538,7 +2555,7 @@ def _render_advanced_analyses(combined_df, precomputed, flags):
             )
         if flags.get("run_centrality"):
             with st.spinner("Running centrality analysis (PageRank, betweenness, logistic regression)..."):
-                result = compute_centrality_prediction(combined_df, precomputed)
+                result = compute_centrality_prediction(cat_combined, precomputed)
 
             if "error" in result:
                 st.error(result["error"])
