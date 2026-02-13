@@ -308,6 +308,35 @@ def visualize_graph(G: nx.Graph | nx.DiGraph,
 # STREAMLIT PAGE
 # ---------------------------------------------------------------------------
 
+@st.cache_resource
+def _cached_build_graph(df_hash, _df, network_type, country_filter, _precomputed):
+    """Cache graph construction — df_hash drives cache invalidation."""
+    if network_type == "Nominator -> Nominee":
+        return build_nomination_graph(_df, country=country_filter)
+    elif network_type == "Co-nomination (shared nominators)":
+        return build_conomination_graph(_df)
+    elif network_type == "Cross-category Combined":
+        return build_combined_nomination_graph(_df, _precomputed)
+    return nx.Graph()
+
+
+@st.cache_data
+def _cached_visualize(graph_key, _G, title, min_edge_weight, color_by):
+    """Cache PyVis HTML generation — graph_key drives cache invalidation."""
+    html_path = visualize_graph(_G, title=title, min_edge_weight=min_edge_weight, color_by=color_by)
+    if html_path:
+        with open(html_path, "r") as f:
+            html_content = f.read()
+        os.unlink(html_path)
+        return html_content
+    return None
+
+
+def _df_hash(df):
+    """Fast deterministic hash for a DataFrame."""
+    return hash((len(df), tuple(df.columns), pd.util.hash_pandas_object(df).sum()))
+
+
 def render_network_page(df: pd.DataFrame, precomputed: dict | None = None,
                         combined_df: pd.DataFrame | None = None):
     """
@@ -355,26 +384,22 @@ def render_network_page(df: pd.DataFrame, precomputed: dict | None = None,
     # --- Main area ---
     st.header("Nomination Networks")
 
-    # Build the appropriate graph
+    # Build the appropriate graph (cached)
     if network_type == "Nominator -> Nominee":
-        G = build_nomination_graph(df, country=country_filter)
+        G = _cached_build_graph(_df_hash(df), df, network_type, country_filter, None)
     elif network_type == "Co-nomination (shared nominators)":
-        G = build_conomination_graph(df)
+        G = _cached_build_graph(_df_hash(df), df, network_type, None, None)
     elif is_cross_category:
         with st.spinner("Building cross-category combined network..."):
-            G = build_combined_nomination_graph(combined_df, precomputed)
+            G = _cached_build_graph(_df_hash(combined_df), combined_df, network_type, None, precomputed)
 
-    # Render interactive visualization first
+    # Render interactive visualization (cached)
     if G.number_of_nodes() > 0:
         color_mode = "category" if is_cross_category else "country"
-        html_path = visualize_graph(
-            G, title=network_type, min_edge_weight=min_weight, color_by=color_mode,
-        )
-        if html_path:
-            with open(html_path, "r") as f:
-                html_content = f.read()
+        graph_key = (G.number_of_nodes(), G.number_of_edges(), network_type, min_weight, color_mode)
+        html_content = _cached_visualize(graph_key, G, network_type, min_weight, color_mode)
+        if html_content:
             st.components.v1.html(html_content, height=720, scrolling=True)
-            os.unlink(html_path)
         else:
             st.info("No edges meet the current filter criteria.")
     else:
