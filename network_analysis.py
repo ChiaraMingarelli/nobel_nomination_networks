@@ -1348,18 +1348,21 @@ def compute_proximity_effect(combined_df: pd.DataFrame, precomputed: dict) -> di
             if hasattr(row, "nominee_prize_year") and pd.notna(row.nominee_prize_year):
                 nominee_won[name] = True
 
-    # Compute shortest-path distance to nearest past laureate for each non-laureate
+    # Compute shortest-path distance to nearest past laureate for each nominee.
+    # Future laureates ARE included in the analysis pool — the question is whether
+    # proximity to *past* laureates predicts *future* winning.  We just exclude
+    # the nominee from being their own "past laureate" target.
     # Key structure: (distance_bucket, decade) -> {n, won}
     bucket_counts = defaultdict(lambda: {"n": 0, "won": 0})
 
-    non_laureate_nodes = [n for n in G.nodes if n not in laureate_nodes]
-
-    for node in non_laureate_nodes:
+    for node in G.nodes:
         first_yr = nominee_first_year.get(node, 9999)
         decade = f"{(first_yr // 10) * 10}s"
 
-        # Find past laureates (won strictly before this nominee's first nomination)
-        past_laureates = {ln for ln, yw in laureate_nodes.items() if yw < first_yr}
+        # Find past laureates (won strictly before this nominee's first nomination),
+        # excluding the nominee themselves
+        past_laureates = {ln for ln, yw in laureate_nodes.items()
+                          if yw < first_yr and ln != node}
         if not past_laureates:
             bucket_counts[("unreachable", decade)]["n"] += 1
             bucket_counts[("unreachable", "all")]["n"] += 1
