@@ -650,6 +650,7 @@ def render_network_page(df: pd.DataFrame, precomputed: dict | None = None,
         adv_options.extend([
             "Three Degrees of Influence",
             "Near-Miss Analysis",
+            "Campaign Success Rate",
             "Centrality Predicts Winners",
         ])
 
@@ -660,9 +661,13 @@ def render_network_page(df: pd.DataFrame, precomputed: dict | None = None,
     show_near_miss = adv_selection == "Near-Miss Analysis"
     show_temporal = adv_selection == "Temporal Evolution"
     show_proximity = adv_selection == "Three Degrees of Influence"
+    show_campaign_success = adv_selection == "Campaign Success Rate"
 
     run_centrality = run_near_miss = run_temporal = run_proximity = False
+    run_campaign_success = False
     near_miss_min = 10
+    cs_min_noms = 5
+    cs_window = 3
 
     if show_centrality:
         run_centrality = st.sidebar.button("Run Centrality Analysis", key="centrality_btn")
@@ -673,6 +678,10 @@ def render_network_page(df: pd.DataFrame, precomputed: dict | None = None,
         run_temporal = st.sidebar.button("Run Evolution Analysis", key="temporal_btn")
     elif show_proximity:
         run_proximity = st.sidebar.button("Run Proximity Analysis", key="proximity_btn")
+    elif show_campaign_success:
+        cs_min_noms = st.sidebar.slider("Min nominations (burst)", 3, 15, 5, key="cs_min_noms")
+        cs_window = st.sidebar.slider("Year window", 1, 5, 3, key="cs_window")
+        run_campaign_success = st.sidebar.button("Run Campaign Success Analysis", key="cs_btn")
 
     # --- Main area: Graph visualization ---
     st.header("Nomination Networks")
@@ -710,6 +719,10 @@ def render_network_page(df: pd.DataFrame, precomputed: dict | None = None,
             "run_temporal": run_temporal,
             "show_proximity": show_proximity,
             "run_proximity": run_proximity,
+            "show_campaign_success": show_campaign_success,
+            "run_campaign_success": run_campaign_success,
+            "cs_min_noms": cs_min_noms,
+            "cs_window": cs_window,
         }
         st.divider()
         st.header("Advanced Network Analyses")
@@ -1565,7 +1578,160 @@ def compute_near_miss_analysis(combined_df: pd.DataFrame, precomputed: dict,
 
 
 # ---------------------------------------------------------------------------
-# ANALYSIS 7: CENTRALITY PREDICTS WINNERS
+# ANALYSIS 7: CAMPAIGN SUCCESS RATE
+# ---------------------------------------------------------------------------
+
+def compute_campaign_success(combined_df: pd.DataFrame, precomputed: dict,
+                             min_nominations: int = 5,
+                             year_window: int = 3) -> dict:
+    """
+    Do detected nomination campaigns actually lead to Nobel prizes?
+
+    Compares the win rate of campaign nominees against a matched control group
+    of nominees with similar total nomination counts but no detected burst.
+    This directly tests whether the 'organized advocacy' Hansson & Schlich
+    emphasize actually worked, or whether the Nobel committee saw through it.
+
+    Returns dict with campaign_nominees table, control table, win rates,
+    and a Fisher's exact test for significance.
+    """
+    from scipy.stats import fisher_exact
+
+    # Detect campaigns on the full combined dataset
+    campaigns_df = detect_campaigns(combined_df, min_nominations=min_nominations,
+                                    year_window=year_window)
+
+    if campaigns_df.empty:
+        return {"error": "No campaigns detected with current thresholds."}
+
+    # Identify campaign nominees (unique names)
+    campaign_names = set(campaigns_df["nominee"].unique())
+
+    # Build per-nominee stats from combined_df
+    has_prize_col = "nominee_prize_year" in combined_df.columns
+    nominee_stats = {}
+    for row in combined_df.itertuples(index=False):
+        nominee = row.nominee_name
+        if nominee not in nominee_stats:
+            won = has_prize_col and pd.notna(row.nominee_prize_year)
+            nominee_stats[nominee] = {"won": bool(won), "total_noms": 0}
+        nominee_stats[nominee]["total_noms"] += 1
+
+    # Build campaign nominee table
+    campaign_rows = []
+    for name in campaign_names:
+        if name in nominee_stats:
+            info = nominee_stats[name]
+            # Get campaign details (best burst)
+            person_campaigns = campaigns_df[campaigns_df["nominee"] == name]
+            best = person_campaigns.iloc[0]  # sorted by n_nominations desc
+            campaign_rows.append({
+                "name": name,
+                "total_noms": info["total_noms"],
+                "won": info["won"],
+                "campaign_noms": int(best["n_nominations"]),
+                "campaign_years": f"{int(best['year_start'])}-{int(best['year_end'])}",
+                "campaign_nominators": int(best["n_unique_nominators"]),
+            })
+
+    campaign_table = pd.DataFrame(campaign_rows)
+    if campaign_table.empty:
+        return {"error": "Could not match campaign nominees to dataset."}
+
+    # Matched control group: non-campaign nominees with comparable nomination counts
+    # For each campaign nominee, find non-campaign nominees in the same total_noms
+    # band (+/- 30% or at least +/- 2). Take up to 3 controls per campaign nominee.
+    non_campaign = {name: info for name, info in nominee_stats.items()
+                    if name not in campaign_names}
+
+    # Sort non-campaign nominees by total_noms for efficient matching
+    non_campaign_list = sorted(non_campaign.items(), key=lambda x: x[1]["total_noms"])
+
+    control_names = set()
+    for _, crow in campaign_table.iterrows():
+        target_noms = crow["total_noms"]
+        margin = max(2, int(target_noms * 0.3))
+        lo, hi = target_noms - margin, target_noms + margin
+
+        matches = [name for name, info in non_campaign_list
+                   if lo <= info["total_noms"] <= hi and name not in control_names]
+        # Take up to 3 controls per campaign nominee
+        for m in matches[:3]:
+            control_names.add(m)
+
+    control_rows = []
+    for name in control_names:
+        info = nominee_stats[name]
+        control_rows.append({
+            "name": name,
+            "total_noms": info["total_noms"],
+            "won": info["won"],
+        })
+    control_table = pd.DataFrame(control_rows) if control_rows else pd.DataFrame(
+        columns=["name", "total_noms", "won"])
+
+    # Compute win rates
+    n_campaign = len(campaign_table)
+    n_campaign_won = int(campaign_table["won"].sum())
+    campaign_win_rate = n_campaign_won / n_campaign if n_campaign > 0 else 0
+
+    n_control = len(control_table)
+    n_control_won = int(control_table["won"].sum()) if n_control > 0 else 0
+    control_win_rate = n_control_won / n_control if n_control > 0 else 0
+
+    # Fisher's exact test: 2x2 contingency table
+    # [[campaign_won, campaign_lost], [control_won, control_lost]]
+    if n_control > 0:
+        contingency = [[n_campaign_won, n_campaign - n_campaign_won],
+                       [n_control_won, n_control - n_control_won]]
+        odds_ratio, p_value = fisher_exact(contingency, alternative="two-sided")
+    else:
+        odds_ratio, p_value = float("nan"), float("nan")
+
+    # Nomination-count-bin breakdown: how does campaign effect vary by nomination level?
+    bins = [(5, 10), (11, 20), (21, 50), (51, 500)]
+    bin_labels = ["5-10", "11-20", "21-50", "51+"]
+    bin_breakdown = []
+    for (lo, hi), label in zip(bins, bin_labels):
+        c_in_bin = campaign_table[(campaign_table["total_noms"] >= lo) &
+                                  (campaign_table["total_noms"] <= hi)]
+        ctrl_in_bin = control_table[(control_table["total_noms"] >= lo) &
+                                    (control_table["total_noms"] <= hi)] if n_control > 0 else pd.DataFrame()
+        n_c = len(c_in_bin)
+        n_ctrl = len(ctrl_in_bin)
+        bin_breakdown.append({
+            "nom_range": label,
+            "campaign_n": n_c,
+            "campaign_won": int(c_in_bin["won"].sum()) if n_c > 0 else 0,
+            "campaign_rate": float(c_in_bin["won"].mean()) if n_c > 0 else 0,
+            "control_n": n_ctrl,
+            "control_won": int(ctrl_in_bin["won"].sum()) if n_ctrl > 0 else 0,
+            "control_rate": float(ctrl_in_bin["won"].mean()) if n_ctrl > 0 else 0,
+        })
+
+    # Mean total nominations for comparison
+    campaign_mean_noms = float(campaign_table["total_noms"].mean())
+    control_mean_noms = float(control_table["total_noms"].mean()) if n_control > 0 else 0
+
+    return {
+        "campaign_table": campaign_table.sort_values("total_noms", ascending=False),
+        "control_table": control_table.sort_values("total_noms", ascending=False) if n_control > 0 else control_table,
+        "n_campaign": n_campaign,
+        "n_campaign_won": n_campaign_won,
+        "campaign_win_rate": campaign_win_rate,
+        "n_control": n_control,
+        "n_control_won": n_control_won,
+        "control_win_rate": control_win_rate,
+        "odds_ratio": odds_ratio,
+        "p_value": p_value,
+        "campaign_mean_noms": campaign_mean_noms,
+        "control_mean_noms": control_mean_noms,
+        "bin_breakdown": pd.DataFrame(bin_breakdown),
+    }
+
+
+# ---------------------------------------------------------------------------
+# ANALYSIS 8: CENTRALITY PREDICTS WINNERS
 # ---------------------------------------------------------------------------
 
 def compute_centrality_prediction(combined_df: pd.DataFrame, precomputed: dict) -> dict:
@@ -2087,6 +2253,185 @@ def _render_advanced_analyses(combined_df, precomputed, flags):
                                  key="winners_csv")
         else:
             st.info("Click **Run Near-Miss Analysis** in the sidebar.")
+
+    # --- Campaign Success Rate ---
+    if flags.get("show_campaign_success"):
+        st.subheader("Campaign Success Rate")
+        st.markdown(
+            "**What this measures:** Hansson & Schlich describe coordinated nomination "
+            "campaigns as a key mechanism of American influence on the Nobel Prize. But did "
+            "campaigns actually *work*? This analysis detects nomination bursts (concentrated "
+            "clusters of nominations within a short window) and compares the win rate of "
+            "campaign nominees against a matched control group of nominees with similar total "
+            "nomination counts but no detected burst.\n\n"
+            "**Matching strategy:** For each campaign nominee, we find non-campaign nominees "
+            "whose total lifetime nomination count falls within +/-30% (minimum +/-2). Up to "
+            "3 controls are matched per campaign nominee to increase statistical power while "
+            "controlling for the most important confounder: raw nomination volume.\n\n"
+            "**What to expect:** If organized advocacy is effective, campaign nominees should "
+            "win at *higher* rates than matched controls. If the Nobel committee sees through "
+            "campaigns (favoring broad, independent support over concentrated pushes), campaign "
+            "nominees should win at *lower* rates -- making campaigns a marker of near-miss "
+            "status rather than a path to success.\n\n"
+            "**Interpretation:** A Fisher's exact test reports whether the difference in win "
+            "rates is statistically significant. Combined with the Near-Miss Analysis, a low "
+            "campaign win rate would tell a coherent story: campaigns produce near-misses, not "
+            "winners, because the committee values distributed independent consensus over "
+            "organized advocacy. This would directly contradict Hansson & Schlich's implication "
+            "that American organizational advantage drove outcomes."
+        )
+        if flags.get("run_campaign_success"):
+            cs_min = flags.get("cs_min_noms", 5)
+            cs_win = flags.get("cs_window", 3)
+            with st.spinner("Detecting campaigns and computing success rates..."):
+                result = compute_campaign_success(combined_df, precomputed,
+                                                  min_nominations=cs_min,
+                                                  year_window=cs_win)
+
+            if "error" in result:
+                st.error(result["error"])
+            else:
+                # Key metrics
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("Campaign nominees", result["n_campaign"])
+                col2.metric("Campaign win rate",
+                            f"{result['campaign_win_rate'] * 100:.1f}%",
+                            help=f"{result['n_campaign_won']}/{result['n_campaign']} won")
+                col3.metric("Control win rate",
+                            f"{result['control_win_rate'] * 100:.1f}%",
+                            help=f"{result['n_control_won']}/{result['n_control']} won")
+                col4.metric("Fisher p-value",
+                            f"{result['p_value']:.3f}" if not np.isnan(result['p_value']) else "N/A")
+
+                # Side-by-side bar chart: campaign vs control win rates
+                fig, ax = plt.subplots(figsize=(6, 4))
+                x = [0, 1]
+                rates = [result["campaign_win_rate"] * 100,
+                         result["control_win_rate"] * 100]
+                labels = [f"Campaign\n(n={result['n_campaign']})",
+                          f"Matched control\n(n={result['n_control']})"]
+                colors = ["#d62728", "#2ca02c"]
+                bars = ax.bar(x, rates, color=colors, edgecolor="black", width=0.5)
+                ax.set_xticks(x)
+                ax.set_xticklabels(labels)
+                ax.set_ylabel("Win rate (%)")
+                ax.set_title("Campaign Nominees vs. Matched Controls")
+                max_rate = max(rates) if max(rates) > 0 else 10
+                ax.set_ylim(0, max_rate * 1.6)
+                for bar, rate in zip(bars, rates):
+                    ax.text(bar.get_x() + bar.get_width() / 2,
+                            bar.get_height() + max_rate * 0.03,
+                            f"{rate:.1f}%", ha="center", va="bottom", fontsize=11,
+                            fontweight="bold")
+                # Add significance annotation
+                p = result["p_value"]
+                if not np.isnan(p):
+                    sig_text = "n.s." if p >= 0.05 else (
+                        "*" if p >= 0.01 else ("**" if p >= 0.001 else "***"))
+                    ax.text(0.5, max_rate * 1.35,
+                            f"Fisher p = {p:.3f} ({sig_text})",
+                            ha="center", va="bottom", fontsize=10,
+                            transform=ax.get_xaxis_transform())
+                fig.tight_layout()
+                st.pyplot(fig)
+                _fig_download_buttons(fig, "campaign_success", "campaign_success")
+                plt.close(fig)
+
+                # Nomination-count bin breakdown — grouped bar chart
+                bin_df = result["bin_breakdown"]
+                if not bin_df.empty and bin_df["campaign_n"].sum() > 0:
+                    st.markdown("#### Win Rate by Nomination Count Band")
+                    st.caption(
+                        "**This is the key comparison.** The overall rates above "
+                        "are confounded by nomination volume (campaign nominees "
+                        "tend to have more total nominations). Within-band "
+                        "comparisons control for this."
+                    )
+
+                    # Grouped bar chart
+                    well_matched = bin_df[
+                        (bin_df["campaign_n"] >= 5) & (bin_df["control_n"] >= 5)
+                    ]
+                    plot_df = well_matched if len(well_matched) > 0 else bin_df
+
+                    fig2, ax2 = plt.subplots(figsize=(8, 4.5))
+                    x_pos = np.arange(len(plot_df))
+                    bar_w = 0.35
+                    bars1 = ax2.bar(x_pos - bar_w / 2,
+                                    plot_df["campaign_rate"].values * 100,
+                                    bar_w, color="#d62728", edgecolor="black",
+                                    label="Campaign")
+                    bars2 = ax2.bar(x_pos + bar_w / 2,
+                                    plot_df["control_rate"].values * 100,
+                                    bar_w, color="#2ca02c", edgecolor="black",
+                                    label="Control")
+                    ax2.set_xticks(x_pos)
+                    ax2.set_xticklabels(plot_df["nom_range"].values)
+                    ax2.set_xlabel("Total lifetime nominations")
+                    ax2.set_ylabel("Win rate (%)")
+                    ax2.set_title(
+                        "Campaign vs. Control Win Rate, Matched by Nomination Count")
+                    ax2.legend()
+                    # Annotate sample sizes
+                    for i, (_, r) in enumerate(plot_df.iterrows()):
+                        ax2.text(i - bar_w / 2, -2.5,
+                                 f"n={int(r['campaign_n'])}", ha="center",
+                                 fontsize=7, color="#d62728")
+                        ax2.text(i + bar_w / 2, -2.5,
+                                 f"n={int(r['control_n'])}", ha="center",
+                                 fontsize=7, color="#2ca02c")
+                    fig2.tight_layout()
+                    st.pyplot(fig2)
+                    _fig_download_buttons(fig2, "campaign_by_band", "campaign_band")
+                    plt.close(fig2)
+
+                    # Full table
+                    display_rows = []
+                    for _, r in bin_df.iterrows():
+                        adequate = r["campaign_n"] >= 5 and r["control_n"] >= 5
+                        display_rows.append({
+                            "Nominations": r["nom_range"],
+                            "Campaign N": int(r["campaign_n"]),
+                            "Campaign won": int(r["campaign_won"]),
+                            "Campaign rate": f"{r['campaign_rate'] * 100:.1f}%",
+                            "Control N": int(r["control_n"]),
+                            "Control won": int(r["control_won"]),
+                            "Control rate": f"{r['control_rate'] * 100:.1f}%",
+                            "Matching": "adequate" if adequate else "sparse",
+                        })
+                    st.dataframe(pd.DataFrame(display_rows), hide_index=True)
+
+                # Mean nomination counts for transparency
+                nom_ratio = result['campaign_mean_noms'] / max(result['control_mean_noms'], 0.1)
+                if nom_ratio > 2.0:
+                    st.warning(
+                        f"Matching imbalance: campaign nominees average "
+                        f"{result['campaign_mean_noms']:.0f} total nominations vs "
+                        f"{result['control_mean_noms']:.0f} for controls. At high "
+                        f"nomination counts, nearly all nominees experienced a burst, "
+                        f"leaving few non-campaign matches. The within-band comparison "
+                        f"above is more reliable than the overall rates."
+                    )
+                st.caption(
+                    f"Mean total nominations: campaign = {result['campaign_mean_noms']:.1f}, "
+                    f"control = {result['control_mean_noms']:.1f}. "
+                    f"Odds ratio = {result['odds_ratio']:.2f}."
+                    if not np.isnan(result['odds_ratio']) else
+                    f"Mean total nominations: campaign = {result['campaign_mean_noms']:.1f}."
+                )
+
+                # Campaign nominees table
+                st.markdown("#### Campaign Nominees")
+                ct = result["campaign_table"]
+                display_cols = ["name", "total_noms", "won", "campaign_noms",
+                                "campaign_years", "campaign_nominators"]
+                st.dataframe(ct[display_cols], hide_index=True)
+                _csv_download_button(ct, "campaign_nominees.csv",
+                                     key="campaign_success_csv")
+                _csv_download_button(result["control_table"], "matched_controls.csv",
+                                     key="control_csv")
+        else:
+            st.info("Click **Run Campaign Success Analysis** in the sidebar.")
 
     # --- Centrality Predicts Winners ---
     if flags.get("show_centrality"):
