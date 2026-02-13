@@ -292,6 +292,7 @@ def collect_nomination_edges(person_ids: dict, category: str) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+@st.cache_data
 def load_precomputed_stats() -> dict:
     """Load precomputed laureate statistics from JSON file (if present)."""
     if PRECOMPUTED_STATS_FILE.exists():
@@ -377,6 +378,7 @@ def cache_filename(category: str) -> Path:
     return DATA_DIR / f"{safe_name}_edges.json"
 
 
+@st.cache_data
 def load_cached_edges(category: str) -> pd.DataFrame | None:
     """Load cached edge data if available."""
     path = cache_filename(category)
@@ -396,6 +398,23 @@ def save_cached_edges(category: str, df: pd.DataFrame):
     path = cache_filename(category)
     with open(path, "w") as f:
         json.dump(df.to_dict(orient="records"), f, indent=2)
+
+
+@st.cache_data
+def load_all_cached_edges() -> pd.DataFrame:
+    """Load all 5 category caches, concatenate, and deduplicate."""
+    frames = []
+    for category in CATEGORY_TO_PRIZE:
+        cat_df = load_cached_edges(category)
+        if cat_df is not None:
+            frames.append(cat_df)
+    if not frames:
+        return pd.DataFrame()
+    combined = pd.concat(frames, ignore_index=True)
+    # Deduplicate on (nomination_id, nominee_id)
+    if "nomination_id" in combined.columns and "nominee_id" in combined.columns:
+        combined = combined.drop_duplicates(subset=["nomination_id", "nominee_id"])
+    return combined
 
 
 # ---------------------------------------------------------------------------
@@ -419,6 +438,9 @@ def main():
 
     # Load precomputed stats for country enrichment (optional — works without it)
     precomputed = load_precomputed_stats()
+
+    # Load combined cross-category data
+    combined_df = load_all_cached_edges()
 
     # --- Sidebar ---
     st.sidebar.header("Data Selection")
@@ -479,7 +501,7 @@ def main():
         return
 
     # --- Main content: render network page ---
-    render_network_page(df)
+    render_network_page(df, precomputed=precomputed, combined_df=combined_df)
 
 
 def _build_data(category: str, year_from: int, year_to: int, precomputed: dict):

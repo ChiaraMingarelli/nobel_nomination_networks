@@ -16,6 +16,8 @@ from pyvis.network import Network
 from collections import defaultdict
 import tempfile
 import os
+import math
+import random
 
 try:
     import streamlit as st
@@ -250,17 +252,34 @@ def visualize_graph(G: nx.Graph | nx.DiGraph,
     for node in G.nodes:
         data = G.nodes[node]
         size = max(8, min(50, data.get(size_by, 1) * 2))
-        color = COUNTRY_COLORS.get(data.get("country", ""), "#cccccc")
+
+        if color_by == "category":
+            color = DISCIPLINE_COLORS.get(data.get("category", ""), "#999999")
+        else:
+            color = COUNTRY_COLORS.get(data.get("country", ""), "#cccccc")
+
         label = node
-        title_text = f"{node}\nCountry: {data.get('country', 'N/A')}"
+        title_text = f"{node}"
+        if data.get("category"):
+            title_text += f"\nCategory: {data['category']}"
+        if data.get("country") and data["country"] != "Unknown":
+            title_text += f"\nCountry: {data['country']}"
         if "total_nominations" in data:
             title_text += f"\nTotal nominations: {data['total_nominations']}"
         if "prize_year" in data:
             title_text += f"\nWon: {data['prize_year']}"
         if "role" in data:
             title_text += f"\nRole: {data['role']}"
+        if data.get("is_laureate"):
+            title_text += "\nLaureate"
 
-        net.add_node(node, label=label, size=size, color=color, title=title_text)
+        # Gold border for laureates
+        node_opts = {"label": label, "size": size, "color": color, "title": title_text}
+        if data.get("is_laureate"):
+            node_opts["borderWidth"] = 3
+            node_opts["color"] = {"background": color, "border": "#FFD700"}
+
+        net.add_node(node, **node_opts)
 
     # Edges
     for u, v, d in G.edges(data=True):
@@ -287,7 +306,8 @@ def visualize_graph(G: nx.Graph | nx.DiGraph,
 # STREAMLIT PAGE
 # ---------------------------------------------------------------------------
 
-def render_network_page(df: pd.DataFrame):
+def render_network_page(df: pd.DataFrame, precomputed: dict | None = None,
+                        combined_df: pd.DataFrame | None = None):
     """
     Full Streamlit page for network analysis.
     Category and year range are already filtered by the caller (sidebar).
@@ -296,16 +316,30 @@ def render_network_page(df: pd.DataFrame):
         print("Streamlit not available. Use this module within a Streamlit app.")
         return
 
+    has_combined = combined_df is not None and not combined_df.empty
+    has_precomputed = precomputed is not None and len(precomputed) > 0
+
     # --- Sidebar filters (below the data selection controls) ---
     st.sidebar.divider()
     st.sidebar.header("Network Controls")
 
-    network_type = st.sidebar.selectbox("Network type", [
+    network_options = [
         "Nominator -> Nominee",
         "Co-nomination (shared nominators)",
-    ])
+    ]
+    if has_combined:
+        network_options.append("Cross-category Combined")
 
-    min_weight = st.sidebar.slider("Min edge weight", 1, 10, 1)
+    network_type = st.sidebar.selectbox("Network type", network_options)
+
+    is_cross_category = network_type == "Cross-category Combined"
+
+    # Default min_weight for cross-category (too many nodes at 1)
+    default_weight = 2 if is_cross_category else 1
+    min_weight = st.sidebar.slider("Min edge weight", 1, 10, default_weight)
+
+    if is_cross_category and min_weight == 1:
+        st.sidebar.warning("Min weight 1 produces ~15K nodes — rendering may be slow.")
 
     country_filter = None
     if network_type == "Nominator -> Nominee" and "nominee_country" in df.columns:
@@ -350,6 +384,21 @@ def render_network_page(df: pd.DataFrame):
             except ImportError:
                 st.warning("Louvain requires networkx >= 2.8")
 
+    elif is_cross_category:
+        with st.spinner("Building cross-category combined network..."):
+            G = build_combined_nomination_graph(combined_df, precomputed)
+        n_laureates = sum(1 for n in G.nodes if G.nodes[n].get("is_laureate", False))
+        st.caption(
+            f"{G.number_of_nodes()} nodes, {G.number_of_edges()} edges, "
+            f"{n_laureates} laureates (gold border)"
+        )
+
+        if G.number_of_nodes() > 0:
+            stats = network_summary(G)
+            cols = st.columns(min(len(stats), 4))
+            for i, (k, v) in enumerate(stats.items()):
+                cols[i % len(cols)].metric(k, v)
+
     # Description + legend
     if G.number_of_nodes() > 0:
         if network_type == "Nominator -> Nominee":
@@ -366,27 +415,60 @@ def render_network_page(df: pd.DataFrame):
                 "Edge thickness = number of shared nominators. "
                 "Clusters reveal communities of nominees championed by the same people."
             )
-        # Color legend — only show countries present in the graph
-        countries_in_graph = set()
-        for node in G.nodes:
-            c = G.nodes[node].get("country", "Unknown")
-            if c:
-                countries_in_graph.add(c)
-        legend_items = []
-        for country in sorted(countries_in_graph):
-            color = COUNTRY_COLORS.get(country, "#cccccc")
-            legend_items.append(
-                f'<span style="color:{color}; font-size:20px;">&#9679;</span> {country}'
-            )
-        if legend_items:
+        elif is_cross_category:
             st.markdown(
-                "**Node color = country:** " + " &nbsp;&nbsp; ".join(legend_items),
+                "**Undirected graph**: all 5 Nobel categories combined. "
+                "Nominator-nominee pairs are linked. "
+                "Node color = discipline. Gold border = laureate. "
+                "Hover over nodes for details."
+            )
+
+        # Color legend
+        if is_cross_category:
+            # Category-based legend
+            categories_in_graph = set()
+            for node in G.nodes:
+                c = G.nodes[node].get("category", "")
+                if c:
+                    categories_in_graph.add(c)
+            legend_items = []
+            for cat in sorted(categories_in_graph):
+                color = DISCIPLINE_COLORS.get(cat, "#999999")
+                legend_items.append(
+                    f'<span style="color:{color}; font-size:20px;">&#9679;</span> {cat}'
+                )
+            legend_items.append(
+                '<span style="color:#FFD700; font-size:20px;">&#9679;</span> Laureate (gold border)'
+            )
+            st.markdown(
+                "**Node color = discipline:** " + " &nbsp;&nbsp; ".join(legend_items),
                 unsafe_allow_html=True,
             )
+        else:
+            # Country-based legend
+            countries_in_graph = set()
+            for node in G.nodes:
+                c = G.nodes[node].get("country", "Unknown")
+                if c:
+                    countries_in_graph.add(c)
+            legend_items = []
+            for country in sorted(countries_in_graph):
+                color = COUNTRY_COLORS.get(country, "#cccccc")
+                legend_items.append(
+                    f'<span style="color:{color}; font-size:20px;">&#9679;</span> {country}'
+                )
+            if legend_items:
+                st.markdown(
+                    "**Node color = country:** " + " &nbsp;&nbsp; ".join(legend_items),
+                    unsafe_allow_html=True,
+                )
 
     # Render interactive visualization
     if G.number_of_nodes() > 0:
-        html_path = visualize_graph(G, title=network_type, min_edge_weight=min_weight)
+        color_mode = "category" if is_cross_category else "country"
+        html_path = visualize_graph(
+            G, title=network_type, min_edge_weight=min_weight, color_by=color_mode,
+        )
         if html_path:
             with open(html_path, "r") as f:
                 html_content = f.read()
@@ -407,6 +489,92 @@ def render_network_page(df: pd.DataFrame):
                              hide_index=True)
             else:
                 st.info("No campaigns detected with current thresholds.")
+
+    # Paper analyses (inspired by Gallotti & De Domenico, 2019)
+    if has_precomputed:
+        with st.expander("Paper Analyses (Gallotti & De Domenico, 2019)"):
+            st.markdown(
+                "Analyses inspired by *Effects of homophily and academic reputation "
+                "in the nomination and selection of Nobel laureates* "
+                "(Gallotti & De Domenico, 2019)."
+            )
+
+            # --- Analysis 1: Endorsement Effect ---
+            st.subheader("Laureate Endorsement Effect")
+            st.caption(
+                "Do nominees endorsed by past laureates win at higher rates?"
+            )
+            analysis_df = combined_df if has_combined else df
+            effect = compute_endorsement_effect(analysis_df, precomputed)
+
+            col1, col2, col3 = st.columns(3)
+            col1.metric(
+                "Endorsed win rate",
+                f"{effect['endorsed_rate']:.1%}",
+                help=f"{effect['endorsed_won']}/{effect['endorsed_total']} nominees endorsed by a past laureate went on to win",
+            )
+            col2.metric(
+                "Non-endorsed win rate",
+                f"{effect['not_endorsed_rate']:.1%}",
+                help=f"{effect['not_endorsed_won']}/{effect['not_endorsed_total']} nominees without laureate endorsement went on to win",
+            )
+            ratio_str = f"{effect['ratio']:.1f}x" if effect['ratio'] != float("inf") else "N/A"
+            col3.metric("Ratio", ratio_str)
+
+            # Bar chart
+            import matplotlib.pyplot as plt
+            fig, ax = plt.subplots(figsize=(5, 3))
+            bars = ax.bar(
+                ["Endorsed\nby laureate", "Not endorsed"],
+                [effect["endorsed_rate"] * 100, effect["not_endorsed_rate"] * 100],
+                color=["#FFD700", "#999999"],
+                edgecolor="black",
+            )
+            ax.set_ylabel("Win rate (%)")
+            ax.set_title("Laureate endorsement effect")
+            for bar, rate in zip(bars, [effect["endorsed_rate"], effect["not_endorsed_rate"]]):
+                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
+                        f"{rate:.1%}", ha="center", va="bottom", fontsize=10)
+            fig.tight_layout()
+            st.pyplot(fig)
+            plt.close(fig)
+
+            # --- Analysis 3: Laureates in LCC ---
+            st.subheader("Laureates in Largest Connected Component")
+            st.caption(
+                "Are laureates over-represented in the LCC? "
+                "Null model: 1000 random permutations of laureate labels."
+            )
+            if st.button("Run LCC Analysis", key="lcc_btn"):
+                with st.spinner("Building combined graph and running permutation test..."):
+                    if has_combined:
+                        G_combined = build_combined_nomination_graph(combined_df, precomputed)
+                    else:
+                        G_combined = build_combined_nomination_graph(df, precomputed)
+                    lcc_result = compute_lcc_analysis(G_combined, precomputed)
+
+                if "error" in lcc_result:
+                    st.error(lcc_result["error"])
+                else:
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric(
+                        "Observed laureates in LCC",
+                        lcc_result["observed"],
+                        help=f"Out of {lcc_result['n_laureates']} total laureates",
+                    )
+                    c2.metric(
+                        "Expected (null model)",
+                        f"{lcc_result['expected_mean']} +/- {lcc_result['expected_std']}",
+                    )
+                    c3.metric(
+                        "Z-score",
+                        lcc_result["z_score"],
+                        help=f"p = {lcc_result['p_value']:.2e}",
+                    )
+                    st.caption(
+                        f"LCC size: {lcc_result['lcc_size']} / {lcc_result['graph_size']} nodes. "
+                        f"Total laureates: {lcc_result['n_laureates']}."
+                    )
 
     # Raw data table
     with st.expander("Raw Edge Data"):
@@ -455,3 +623,264 @@ def _filter(df, category=None, year_range=None, country=None):
     if country and "nominee_country" in filtered.columns:
         filtered = filtered[filtered["nominee_country"] == country]
     return filtered
+
+
+# ---------------------------------------------------------------------------
+# CATEGORY COLORS (for cross-category view)
+# ---------------------------------------------------------------------------
+
+DISCIPLINE_COLORS = {
+    "Physics": "#1f77b4",
+    "Chemistry": "#2ca02c",
+    "Physiology or Medicine": "#d62728",
+    "Medicine": "#d62728",
+    "Literature": "#9467bd",
+    "Peace": "#ff7f0e",
+    "nominator": "#999999",
+}
+
+
+# ---------------------------------------------------------------------------
+# NAME MATCHING (for linking nominators to laureates)
+# ---------------------------------------------------------------------------
+
+def normalize_laureate_name(name: str) -> str:
+    """Lowercase, strip middle initials (1-2 char tokens), remove title suffixes."""
+    name = name.lower().strip()
+    # Remove common suffixes
+    for suffix in [", jr.", ", jr", " jr.", " jr", ", sr.", ", sr", " sr.", " sr"]:
+        name = name.replace(suffix, "")
+    tokens = name.split()
+    # Keep only tokens longer than 2 chars (drop middle initials like "A", "C", "von")
+    # But keep 'von', 'de', 'van' etc. — only drop single-letter tokens and 2-letter with period
+    filtered = []
+    for t in tokens:
+        if len(t) <= 2 and (len(t) == 1 or t.endswith(".")):
+            continue
+        filtered.append(t)
+    return " ".join(filtered)
+
+
+def build_laureate_lookup(precomputed: dict) -> dict:
+    """
+    Build {normalized_name: {name, year_won, category, id}} for all laureates
+    across all 5 categories in precomputed_stats.
+    """
+    lookup = {}
+    for cat_key, entries in precomputed.items():
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            name = entry.get("Name", "")
+            year_won = entry.get("Year Won")
+            category = entry.get("Prize Category", cat_key)
+            eid = str(entry.get("ID", ""))
+            if not name or not year_won:
+                continue
+            norm = normalize_laureate_name(name)
+            lookup[norm] = {
+                "name": name,
+                "year_won": int(year_won),
+                "category": category,
+                "id": eid,
+            }
+    return lookup
+
+
+def match_nominator_to_laureate(nominator_name: str, laureate_lookup: dict) -> dict | None:
+    """
+    Two-tier matching: (1) full normalized match, (2) first+last name fallback.
+    Returns laureate info dict or None.
+    """
+    norm = normalize_laureate_name(nominator_name)
+
+    # Tier 1: exact normalized match
+    if norm in laureate_lookup:
+        return laureate_lookup[norm]
+
+    # Tier 2: first + last name only
+    tokens = norm.split()
+    if len(tokens) >= 2:
+        short = f"{tokens[0]} {tokens[-1]}"
+        for key, val in laureate_lookup.items():
+            key_tokens = key.split()
+            if len(key_tokens) >= 2:
+                key_short = f"{key_tokens[0]} {key_tokens[-1]}"
+                if short == key_short:
+                    return val
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# ANALYSIS 1: LAUREATE ENDORSEMENT EFFECT
+# ---------------------------------------------------------------------------
+
+def compute_endorsement_effect(df: pd.DataFrame, precomputed: dict) -> dict:
+    """
+    For each nominee, check whether any of their nominators were laureates
+    who won strictly before the nomination year. Compare win rates.
+
+    Returns dict with endorsed/non-endorsed win rates and ratio.
+    """
+    laureate_lookup = build_laureate_lookup(precomputed)
+
+    # For each unique nominee, track: endorsed by a laureate? did they win?
+    nominee_info = {}  # nominee_name -> {endorsed: bool, won: bool}
+
+    for _, row in df.iterrows():
+        nominee = row["nominee_name"]
+        nom_year = row["year"]
+        nominator = row["nominator_name"]
+
+        if nominee not in nominee_info:
+            won = pd.notna(row.get("nominee_prize_year")) if "nominee_prize_year" in row.index else False
+            nominee_info[nominee] = {"endorsed": False, "won": bool(won)}
+
+        # Check if this nominator was a laureate who won before this nomination
+        laureate = match_nominator_to_laureate(nominator, laureate_lookup)
+        if laureate and laureate["year_won"] < nom_year:
+            nominee_info[nominee]["endorsed"] = True
+
+    endorsed_won = sum(1 for v in nominee_info.values() if v["endorsed"] and v["won"])
+    endorsed_total = sum(1 for v in nominee_info.values() if v["endorsed"])
+    not_endorsed_won = sum(1 for v in nominee_info.values() if not v["endorsed"] and v["won"])
+    not_endorsed_total = sum(1 for v in nominee_info.values() if not v["endorsed"])
+
+    endorsed_rate = endorsed_won / endorsed_total if endorsed_total > 0 else 0
+    not_endorsed_rate = not_endorsed_won / not_endorsed_total if not_endorsed_total > 0 else 0
+    ratio = endorsed_rate / not_endorsed_rate if not_endorsed_rate > 0 else float("inf")
+
+    return {
+        "endorsed_total": endorsed_total,
+        "endorsed_won": endorsed_won,
+        "endorsed_rate": endorsed_rate,
+        "not_endorsed_total": not_endorsed_total,
+        "not_endorsed_won": not_endorsed_won,
+        "not_endorsed_rate": not_endorsed_rate,
+        "ratio": ratio,
+    }
+
+
+# ---------------------------------------------------------------------------
+# ANALYSIS 2: CROSS-CATEGORY COMBINED NETWORK
+# ---------------------------------------------------------------------------
+
+def build_combined_nomination_graph(df: pd.DataFrame, precomputed: dict) -> nx.Graph:
+    """
+    Build an undirected graph: nominator <-> nominee edges, accumulate weight.
+    Node attributes include category (from laureate data or most-frequent
+    nomination category) and is_laureate flag.
+    """
+    laureate_lookup = build_laureate_lookup(precomputed)
+
+    G = nx.Graph()
+    edge_weights = defaultdict(int)
+    node_categories = defaultdict(lambda: defaultdict(int))  # node -> {category: count}
+
+    for _, row in df.iterrows():
+        nominator = row["nominator_name"]
+        nominee = row["nominee_name"]
+        cat = row.get("category", "Unknown")
+
+        edge_weights[(nominator, nominee)] += 1
+        node_categories[nominee][cat] += 1
+        node_categories[nominator][cat] += 1
+
+    for (n1, n2), weight in edge_weights.items():
+        G.add_edge(n1, n2, weight=weight)
+
+    # Set node attributes
+    for node in G.nodes:
+        # Check if this node is a laureate
+        laureate = match_nominator_to_laureate(node, laureate_lookup)
+        if laureate:
+            G.nodes[node]["category"] = laureate["category"]
+            G.nodes[node]["is_laureate"] = True
+            G.nodes[node]["prize_year"] = laureate["year_won"]
+        else:
+            # Use most-frequent nomination category
+            cats = node_categories.get(node, {})
+            if cats:
+                G.nodes[node]["category"] = max(cats, key=cats.get)
+            else:
+                G.nodes[node]["category"] = "Unknown"
+            G.nodes[node]["is_laureate"] = False
+
+        G.nodes[node]["total_nominations"] = sum(
+            d.get("weight", 1) for _, _, d in G.edges(node, data=True)
+        )
+
+    return G
+
+
+# ---------------------------------------------------------------------------
+# ANALYSIS 3: LAUREATES IN LARGEST CONNECTED COMPONENT
+# ---------------------------------------------------------------------------
+
+def compute_lcc_analysis(G: nx.Graph, precomputed: dict, n_permutations: int = 1000) -> dict:
+    """
+    Test whether laureates are over-represented in the largest connected component.
+
+    Counts unique laureate IDs (not nodes) to avoid inflating the count when the
+    same person appears under multiple name spellings.
+
+    Null model: randomly pick n_unique_laureates nodes from the graph,
+    count how many land in the LCC, repeat 1000 times.
+
+    Returns dict with observed count, expected mean/std, z-score, and sizes.
+    """
+    laureate_lookup = build_laureate_lookup(precomputed)
+
+    # Map each node to its laureate ID (if any), deduplicating by ID
+    node_to_lid = {}
+    for node in G.nodes:
+        laureate = match_nominator_to_laureate(node, laureate_lookup)
+        if laureate:
+            node_to_lid[node] = laureate["id"]
+
+    # Count unique laureate IDs
+    unique_lids = set(node_to_lid.values())
+    n_laureates = len(unique_lids)
+    if n_laureates == 0:
+        return {"error": "No laureates found in graph"}
+
+    # Find largest connected component
+    components = list(nx.connected_components(G))
+    if not components:
+        return {"error": "No connected components"}
+
+    lcc = max(components, key=len)
+    lcc_size = len(lcc)
+    graph_size = G.number_of_nodes()
+
+    # Observed: how many unique laureate IDs have at least one node in the LCC?
+    lids_in_lcc = {node_to_lid[n] for n in node_to_lid if n in lcc}
+    observed = len(lids_in_lcc)
+
+    # Null model: randomly pick n_laureates nodes, count how many land in LCC
+    all_nodes = list(G.nodes)
+    rng = random.Random(42)
+    null_counts = []
+    for _ in range(n_permutations):
+        random_picks = set(rng.sample(all_nodes, n_laureates))
+        null_counts.append(len(random_picks & lcc))
+
+    expected_mean = sum(null_counts) / len(null_counts)
+    variance = sum((x - expected_mean) ** 2 for x in null_counts) / len(null_counts)
+    expected_std = math.sqrt(variance) if variance > 0 else 1e-10
+
+    z_score = (observed - expected_mean) / expected_std
+    # One-sided p-value using complementary error function
+    p_value = math.erfc(z_score / math.sqrt(2)) / 2
+
+    return {
+        "observed": observed,
+        "expected_mean": round(expected_mean, 1),
+        "expected_std": round(expected_std, 2),
+        "z_score": round(z_score, 2),
+        "p_value": p_value,
+        "lcc_size": lcc_size,
+        "graph_size": graph_size,
+        "n_laureates": n_laureates,
+    }
