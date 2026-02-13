@@ -620,64 +620,70 @@ def render_network_page(df: pd.DataFrame, precomputed: dict | None = None,
         if country_filter == "All":
             country_filter = None
 
-    # --- Sidebar: Analysis options ---
+    # --- Sidebar: Analyses ---
+    # Ordered by narrative flow:
+    #   Network structure → Prediction → Campaigns → Data
     st.sidebar.divider()
     st.sidebar.header("Analyses")
 
-    show_campaigns = st.sidebar.checkbox("Campaign Detection", key="show_campaigns")
-    run_campaigns = False
-    if show_campaigns:
-        min_noms = st.sidebar.slider("Min nominations", 3, 15, 5, key="campaign_min")
-        campaign_window = st.sidebar.slider("Year window", 1, 5, 3, key="campaign_window")
-        run_campaigns = st.sidebar.button("Detect campaigns")
-
-    show_paper = has_precomputed and st.sidebar.checkbox(
-        "Paper Analyses (Gallotti & De Domenico)", key="show_paper",
-    )
-    run_lcc = False
-    if show_paper:
-        run_lcc = st.sidebar.button("Run LCC Analysis", key="lcc_btn")
-    show_raw = st.sidebar.checkbox("Raw Edge Data", key="show_raw")
-
-    # --- Sidebar: Advanced Analyses ---
-    st.sidebar.divider()
-    st.sidebar.header("Advanced Analyses")
-
-    adv_options = ["None"]
+    analysis_options = ["None"]
+    # -- Network structure --
     if has_combined:
-        adv_options.append("Temporal Evolution")
+        analysis_options.append("Temporal Evolution")
+    # -- What predicts winning --
+    if has_precomputed:
+        analysis_options.append("Endorsement & LCC")
     if has_combined and has_precomputed:
-        adv_options.extend([
+        analysis_options.extend([
+            "Centrality Predicts Winners",
             "Three Degrees of Influence",
             "Near-Miss Analysis",
-            "Campaign Success Rate",
-            "Centrality Predicts Winners",
         ])
+    # -- Campaigns --
+    analysis_options.append("Campaign Detection")
+    if has_combined and has_precomputed:
+        analysis_options.append("Campaign Success Rate")
+    # -- Data --
+    analysis_options.append("Raw Edge Data")
 
-    adv_selection = st.sidebar.selectbox(
-        "Select analysis", adv_options, key="adv_analysis_select")
+    analysis_selection = st.sidebar.radio(
+        "Select analysis", analysis_options, key="analysis_select",
+        label_visibility="collapsed")
 
-    show_centrality = adv_selection == "Centrality Predicts Winners"
-    show_near_miss = adv_selection == "Near-Miss Analysis"
-    show_temporal = adv_selection == "Temporal Evolution"
-    show_proximity = adv_selection == "Three Degrees of Influence"
-    show_campaign_success = adv_selection == "Campaign Success Rate"
+    # Per-analysis sidebar controls
+    show_temporal = analysis_selection == "Temporal Evolution"
+    show_paper = analysis_selection == "Endorsement & LCC"
+    show_centrality = analysis_selection == "Centrality Predicts Winners"
+    show_proximity = analysis_selection == "Three Degrees of Influence"
+    show_near_miss = analysis_selection == "Near-Miss Analysis"
+    show_campaigns = analysis_selection == "Campaign Detection"
+    show_campaign_success = analysis_selection == "Campaign Success Rate"
+    show_raw = analysis_selection == "Raw Edge Data"
 
+    run_campaigns = run_lcc = False
     run_centrality = run_near_miss = run_temporal = run_proximity = False
     run_campaign_success = False
+    min_noms = 5
+    campaign_window = 3
     near_miss_min = 10
     cs_min_noms = 5
     cs_window = 3
 
-    if show_centrality:
+    if show_temporal:
+        run_temporal = st.sidebar.button("Run Evolution Analysis", key="temporal_btn")
+    elif show_paper:
+        run_lcc = st.sidebar.button("Run LCC Analysis", key="lcc_btn")
+    elif show_centrality:
         run_centrality = st.sidebar.button("Run Centrality Analysis", key="centrality_btn")
+    elif show_proximity:
+        run_proximity = st.sidebar.button("Run Proximity Analysis", key="proximity_btn")
     elif show_near_miss:
         near_miss_min = st.sidebar.slider("Min nominations", 5, 30, 10, key="near_miss_min")
         run_near_miss = st.sidebar.button("Run Near-Miss Analysis", key="near_miss_btn")
-    elif show_temporal:
-        run_temporal = st.sidebar.button("Run Evolution Analysis", key="temporal_btn")
-    elif show_proximity:
-        run_proximity = st.sidebar.button("Run Proximity Analysis", key="proximity_btn")
+    elif show_campaigns:
+        min_noms = st.sidebar.slider("Min nominations", 3, 15, 5, key="campaign_min")
+        campaign_window = st.sidebar.slider("Year window", 1, 5, 3, key="campaign_window")
+        run_campaigns = st.sidebar.button("Detect campaigns")
     elif show_campaign_success:
         cs_min_noms = st.sidebar.slider("Min nominations (burst)", 3, 15, 5, key="cs_min_noms")
         cs_window = st.sidebar.slider("Year window", 1, 5, 3, key="cs_window")
@@ -694,40 +700,39 @@ def render_network_page(df: pd.DataFrame, precomputed: dict | None = None,
         with st.spinner("Building cross-category combined network..."):
             G = _cached_build_graph(_df_hash(combined_df), combined_df, network_type, None, precomputed)
 
-    has_adv = has_combined and adv_selection != "None"
+    _render_graph_visualization(G, network_type, min_weight, is_cross_category)
 
-    if has_adv:
-        # Show advanced analysis instead of graph — no tabs (iframes cause
-        # white space in hidden tabs).
-        adv_flags = {
-            "show_centrality": show_centrality,
-            "run_centrality": run_centrality,
-            "show_near_miss": show_near_miss,
-            "run_near_miss": run_near_miss,
-            "near_miss_min": near_miss_min,
-            "show_temporal": show_temporal,
-            "run_temporal": run_temporal,
-            "show_proximity": show_proximity,
-            "run_proximity": run_proximity,
-            "show_campaign_success": show_campaign_success,
-            "run_campaign_success": run_campaign_success,
-            "cs_min_noms": cs_min_noms,
-            "cs_window": cs_window,
-        }
-        _render_advanced_analyses(combined_df, precomputed, adv_flags)
-    else:
-        _render_graph_visualization(G, network_type, min_weight, is_cross_category)
+    # --- Selected analysis below the graph ---
+    if analysis_selection != "None":
+        st.divider()
 
-        if show_campaigns and run_campaigns:
-            _render_campaigns(df, min_noms, campaign_window)
+    if show_campaigns and run_campaigns:
+        _render_campaigns(df, min_noms, campaign_window)
 
-        if show_paper:
-            _render_paper_analyses(df, combined_df, precomputed, has_combined, run_lcc)
+    if show_paper:
+        _render_paper_analyses(df, combined_df, precomputed, has_combined, run_lcc)
 
-        if show_raw:
-            st.subheader("Raw Edge Data")
-            st.dataframe(df, hide_index=True)
-            _csv_download_button(df, "nomination_edges.csv", key="raw_edges_csv")
+    if show_raw:
+        st.subheader("Raw Edge Data")
+        st.dataframe(df, hide_index=True)
+        _csv_download_button(df, "nomination_edges.csv", key="raw_edges_csv")
+
+    adv_flags = {
+        "show_centrality": show_centrality,
+        "run_centrality": run_centrality,
+        "show_near_miss": show_near_miss,
+        "run_near_miss": run_near_miss,
+        "near_miss_min": near_miss_min,
+        "show_temporal": show_temporal,
+        "run_temporal": run_temporal,
+        "show_proximity": show_proximity,
+        "run_proximity": run_proximity,
+        "show_campaign_success": show_campaign_success,
+        "run_campaign_success": run_campaign_success,
+        "cs_min_noms": cs_min_noms,
+        "cs_window": cs_window,
+    }
+    _render_advanced_analyses(combined_df, precomputed, adv_flags)
 
 
 # ---------------------------------------------------------------------------
