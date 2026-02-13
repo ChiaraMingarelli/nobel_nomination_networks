@@ -483,9 +483,11 @@ def render_network_page(df: pd.DataFrame, precomputed: dict | None = None,
     st.sidebar.header("Analyses")
 
     show_campaigns = st.sidebar.checkbox("Campaign Detection", key="show_campaigns")
+    run_campaigns = False
     if show_campaigns:
         min_noms = st.sidebar.slider("Min nominations", 3, 15, 5, key="campaign_min")
         campaign_window = st.sidebar.slider("Year window", 1, 5, 3, key="campaign_window")
+        run_campaigns = st.sidebar.button("Detect campaigns")
 
     show_paper = has_precomputed and st.sidebar.checkbox(
         "Paper Analyses (Gallotti & De Domenico)", key="show_paper",
@@ -494,20 +496,19 @@ def render_network_page(df: pd.DataFrame, precomputed: dict | None = None,
 
     # --- Main area: render selected analyses ---
 
-    if show_campaigns:
+    if show_campaigns and run_campaigns:
         st.subheader("Campaign Detection")
-        if st.button("Detect campaigns"):
-            campaigns = detect_campaigns(df, min_nominations=min_noms, year_window=campaign_window)
-            if len(campaigns) > 0:
-                display_cols = ["nominee", "year_start", "year_end",
-                                "n_nominations", "n_unique_nominators"]
-                st.dataframe(campaigns[display_cols], hide_index=True)
-                _csv_download_button(
-                    campaigns[display_cols],
-                    "campaigns.csv", key="campaigns_csv",
-                )
-            else:
-                st.info("No campaigns detected with current thresholds.")
+        campaigns = detect_campaigns(df, min_nominations=min_noms, year_window=campaign_window)
+        if len(campaigns) > 0:
+            display_cols = ["nominee", "year_start", "year_end",
+                            "n_nominations", "n_unique_nominators"]
+            st.dataframe(campaigns[display_cols], hide_index=True)
+            _csv_download_button(
+                campaigns[display_cols],
+                "campaigns.csv", key="campaigns_csv",
+            )
+        else:
+            st.info("No campaigns detected with current thresholds.")
 
     if show_paper:
         st.subheader("Paper Analyses (Gallotti & De Domenico, 2019)")
