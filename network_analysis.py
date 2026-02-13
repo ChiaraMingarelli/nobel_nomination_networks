@@ -1944,28 +1944,19 @@ def _render_advanced_analyses(combined_df, precomputed, flags):
     # --- Temporal Evolution ---
     if flags.get("show_temporal"):
         st.subheader("Temporal Network Evolution")
-        st.markdown(
-            "**What this measures:** We build a cumulative nomination network for each "
-            "year from 1901 to 1970, adding that year's edges to all prior edges. At each "
-            "year we track four structural properties: **(a)** the fraction of the network "
-            "in the giant connected component (GCC), **(b)** mean degree (average number "
-            "of connections per person), **(c)** clustering coefficient (how often a "
-            "person's contacts are also connected to each other), and **(d)** total "
-            "network size.\n\n"
-            "**What to expect:** The GCC fraction should rise sharply in the early decades "
-            "as the network 'percolates' -- isolated clusters merge into one large "
-            "component. Look for a phase transition around 1920-1930 (the dashed line "
-            "marks 1925, a structural transition identified by Hansson & Schlich). Mean "
-            "degree should grow steadily as repeat nominations accumulate. Per-category "
-            "lines may diverge: Physics and Chemistry typically grow faster than "
-            "Literature or Peace.\n\n"
-            "**Interpretation:** A rapid rise in GCC fraction indicates the nomination "
-            "community became *structurally integrated* -- most nominators and nominees "
-            "are connected through some chain of shared nominations. This matters because "
-            "information (and reputation) can flow through connected networks. A high "
-            "clustering coefficient means nominations are locally clustered: the people "
-            "who nominate the same candidate also tend to nominate each other's candidates."
-        )
+        with st.expander("About this analysis"):
+            st.markdown(
+                "**What this measures:** Cumulative nomination network built year-by-year "
+                "(1901-1970), tracking GCC fraction, mean degree, clustering coefficient, "
+                "and network size.\n\n"
+                "**What to expect:** GCC fraction rises sharply around 1920-1930 as the "
+                "network percolates (dashed line at 1925, per Hansson & Schlich). "
+                "Per-category lines may diverge: Physics/Chemistry grow faster than "
+                "Literature/Peace.\n\n"
+                "**Interpretation:** A rapid GCC rise means the nomination community "
+                "became structurally integrated -- reputation can flow through connected "
+                "chains. High clustering means nominations are locally clustered."
+            )
         if flags.get("run_temporal"):
             with st.spinner("Computing temporal evolution (building 70 cumulative graphs)..."):
                 result = compute_temporal_evolution(combined_df)
@@ -2062,27 +2053,18 @@ def _render_advanced_analyses(combined_df, precomputed, flags):
     # --- Three Degrees of Influence ---
     if flags.get("show_proximity"):
         st.subheader("Three Degrees of Influence")
-        st.markdown(
-            "**What this measures:** In the co-nomination network (where nominees are "
-            "linked when they share a nominator), we compute each non-laureate nominee's "
-            "shortest-path distance to the nearest *past* laureate -- someone who won "
-            "strictly before that nominee's last nomination year. We then group nominees "
-            "by distance (1 hop, 2 hops, 3 hops, 4+, or unreachable) and compute the "
-            "win rate in each bucket.\n\n"
-            "**What to expect:** If the 'three degrees of influence' hypothesis holds, "
-            "win rates should decrease with distance: nominees who are 1 hop from a past "
-            "laureate should win more often than those 2 or 3 hops away. Unreachable "
-            "nominees (in a different connected component) should have the lowest win rate. "
-            "The effect may be strongest within 1-2 hops and flatten beyond 3.\n\n"
-            "**Interpretation:** A declining win rate with distance suggests that being "
-            "embedded in the same nomination neighborhood as past laureates is predictive "
-            "of success. This could reflect genuine influence (laureates advocate for "
-            "nearby nominees), shared quality (similar-caliber scientists are co-nominated "
-            "by the same experts), or institutional clustering (elite departments produce "
-            "both laureates and future laureates). The analysis cannot distinguish these "
-            "mechanisms, but a strong distance gradient is evidence that network position "
-            "matters."
-        )
+        with st.expander("About this analysis"):
+            st.markdown(
+                "**What this measures:** Shortest-path distance from each nominee to the "
+                "nearest *past* laureate in the co-nomination network (nominees linked when "
+                "they share a nominator). Win rate computed per distance bucket (1, 2, 3, "
+                "4+, unreachable).\n\n"
+                "**What to expect:** Win rates should decrease with distance if network "
+                "proximity to laureates matters. Effect strongest within 1-2 hops.\n\n"
+                "**Interpretation:** A distance gradient could reflect laureate advocacy, "
+                "shared quality, or institutional clustering. Cannot distinguish mechanisms, "
+                "but a strong gradient is evidence that network position matters."
+            )
         if flags.get("run_proximity"):
             with st.spinner("Computing proximity to laureates (BFS from each nominee)..."):
                 result = compute_proximity_effect(combined_df, precomputed)
@@ -2157,32 +2139,19 @@ def _render_advanced_analyses(combined_df, precomputed, flags):
     # --- Near-Miss Analysis ---
     if flags.get("show_near_miss"):
         st.subheader("Near-Miss Analysis")
-        st.markdown(
-            "**What this measures:** We identify 'near-misses' -- nominees who received "
-            "many nominations but never won -- and compare their nomination neighborhoods "
-            "to winners with similar nomination counts. Four metrics capture different "
-            "aspects of support structure:\n"
-            "- **Support breadth**: number of unique nominators (wide vs. narrow support)\n"
-            "- **Nominator diversity**: number of distinct communities among a nominee's "
-            "nominators (are they championed by one clique or multiple independent groups?)\n"
-            "- **Nominator reach**: mean degree of a nominee's nominators (are they "
-            "nominated by well-connected, influential people or by peripheral ones?)\n"
-            "- **Concentration** (Herfindahl index): how evenly spread the nominations "
-            "are across nominators (1.0 = all from one person; low = distributed)\n\n"
-            "**What to expect:** If winning depends on more than raw nomination count, "
-            "winners should differ from near-misses on these structural metrics. "
-            "Specifically, winners may have *broader* support (more unique nominators), "
-            "*more diverse* nominator communities, and *higher-reach* nominators. "
-            "Near-misses may show higher concentration (intense support from a small "
-            "group that wasn't enough).\n\n"
-            "**Interpretation:** The box plots compare distributions and the Mann-Whitney "
-            "U test reports whether the difference is statistically significant "
-            "(p < 0.05). A significant difference in breadth or diversity suggests that "
-            "*who* supports you and *how many independent groups* back you matters more "
-            "than raw nomination volume alone. This aligns with the idea that the Nobel "
-            "committee is more persuaded by broad, independent consensus than by a "
-            "concentrated campaign from a single community."
-        )
+        with st.expander("About this analysis"):
+            st.markdown(
+                "**What this measures:** Compares heavily-nominated non-winners ('near-misses') "
+                "to winners with similar nomination counts on four structural metrics: "
+                "**breadth** (unique nominators), **diversity** (independent nominator communities), "
+                "**reach** (mean nominator degree), and **concentration** (Herfindahl index).\n\n"
+                "**What to expect:** Winners should have broader, more diverse support from "
+                "higher-reach nominators. Near-misses may show higher concentration (intense "
+                "but narrow support).\n\n"
+                "**Interpretation:** Mann-Whitney U tests report significance (p < 0.05). "
+                "Differences suggest the committee values broad independent consensus over "
+                "concentrated campaigns from a single community."
+            )
         if flags.get("run_near_miss"):
             min_noms = flags.get("near_miss_min", 10)
             with st.spinner(f"Analyzing near-misses (min {min_noms} nominations)..."):
@@ -2257,29 +2226,20 @@ def _render_advanced_analyses(combined_df, precomputed, flags):
     # --- Campaign Success Rate ---
     if flags.get("show_campaign_success"):
         st.subheader("Campaign Success Rate")
-        st.markdown(
-            "**What this measures:** Hansson & Schlich describe coordinated nomination "
-            "campaigns as a key mechanism of American influence on the Nobel Prize. But did "
-            "campaigns actually *work*? This analysis detects nomination bursts (concentrated "
-            "clusters of nominations within a short window) and compares the win rate of "
-            "campaign nominees against a matched control group of nominees with similar total "
-            "nomination counts but no detected burst.\n\n"
-            "**Matching strategy:** For each campaign nominee, we find non-campaign nominees "
-            "whose total lifetime nomination count falls within +/-30% (minimum +/-2). Up to "
-            "3 controls are matched per campaign nominee to increase statistical power while "
-            "controlling for the most important confounder: raw nomination volume.\n\n"
-            "**What to expect:** If organized advocacy is effective, campaign nominees should "
-            "win at *higher* rates than matched controls. If the Nobel committee sees through "
-            "campaigns (favoring broad, independent support over concentrated pushes), campaign "
-            "nominees should win at *lower* rates -- making campaigns a marker of near-miss "
-            "status rather than a path to success.\n\n"
-            "**Interpretation:** A Fisher's exact test reports whether the difference in win "
-            "rates is statistically significant. Combined with the Near-Miss Analysis, a low "
-            "campaign win rate would tell a coherent story: campaigns produce near-misses, not "
-            "winners, because the committee values distributed independent consensus over "
-            "organized advocacy. This would directly contradict Hansson & Schlich's implication "
-            "that American organizational advantage drove outcomes."
-        )
+        with st.expander("About this analysis"):
+            st.markdown(
+                "**What this measures:** Compares win rates of campaign nominees (detected "
+                "nomination bursts) against matched controls with similar total nomination "
+                "counts but no burst. Tests whether organized advocacy (Hansson & Schlich) "
+                "actually drove outcomes.\n\n"
+                "**Matching:** Controls matched within +/-30% of each campaign nominee's "
+                "total nominations (up to 3 per campaign nominee), controlling for raw "
+                "nomination volume.\n\n"
+                "**Interpretation:** If campaigns work, campaign nominees win at higher "
+                "rates. If the committee sees through them, campaigns mark near-misses, "
+                "not winners. The within-band comparison (grouped bar chart) is the key "
+                "result -- overall rates are confounded by nomination volume."
+            )
         if flags.get("run_campaign_success"):
             cs_min = flags.get("cs_min_noms", 5)
             cs_win = flags.get("cs_window", 3)
@@ -2436,35 +2396,20 @@ def _render_advanced_analyses(combined_df, precomputed, flags):
     # --- Centrality Predicts Winners ---
     if flags.get("show_centrality"):
         st.subheader("Centrality Predicts Winners")
-        st.markdown(
-            "**What this measures:** At 5-year snapshots (1910, 1915, ..., 1965), we "
-            "build the cumulative nomination network and compute four centrality measures "
-            "for each nominee:\n"
-            "- **In-degree** (weighted): raw nomination count -- the baseline\n"
-            "- **PageRank**: a nominee's importance weighted by the importance of their "
-            "nominators (being nominated by someone who is themselves highly nominated "
-            "counts more)\n"
-            "- **Betweenness centrality**: how often a nominee lies on the shortest path "
-            "between other people in the network (bridge positions)\n"
-            "- **Eigenvector centrality**: similar to PageRank but for undirected "
-            "influence -- being connected to other well-connected people\n\n"
-            "We then ask: does a nominee win within 10 years after the snapshot? Two "
-            "logistic regression models are compared using 5-fold cross-validated "
-            "AUC-ROC: **(A)** in-degree only (does raw nomination count predict winning?) "
-            "vs. **(B)** all four centrality features (does structural position add "
-            "predictive power?).\n\n"
-            "**What to expect:** The baseline AUC should be above 0.5 (nomination count "
-            "alone has some predictive value). If structural position matters, the full "
-            "model's AUC should be meaningfully higher. The coefficient table reveals "
-            "which centrality feature contributes most.\n\n"
-            "**Interpretation:** An AUC improvement from adding PageRank/betweenness/"
-            "eigenvector means that *who* nominates you carries information beyond *how "
-            "many* people nominate you. A large positive PageRank coefficient, for "
-            "example, would mean that being nominated by influential nominators predicts "
-            "winning. The ROC curve visualizes the tradeoff between true positives "
-            "(correctly predicted winners) and false positives (non-winners predicted to "
-            "win) -- a curve closer to the top-left corner indicates better prediction."
-        )
+        with st.expander("About this analysis"):
+            st.markdown(
+                "**What this measures:** At 5-year snapshots, computes four centrality "
+                "measures (in-degree, PageRank, betweenness, eigenvector) for each nominee "
+                "and predicts whether they win within 10 years. Compares AUC-ROC of "
+                "in-degree-only vs. full-centrality logistic regression using "
+                "leave-one-snapshot-out CV.\n\n"
+                "**What to expect:** Baseline AUC > 0.5 (nomination count predicts winning). "
+                "If structural position matters, the full model's AUC should be higher. "
+                "Coefficient table reveals which centrality feature contributes most.\n\n"
+                "**Interpretation:** An AUC improvement means *who* nominates you carries "
+                "information beyond *how many*. A positive PageRank coefficient means being "
+                "nominated by influential nominators predicts winning."
+            )
         if flags.get("run_centrality"):
             with st.spinner("Running centrality analysis (PageRank, betweenness, logistic regression)..."):
                 result = compute_centrality_prediction(combined_df, precomputed)
