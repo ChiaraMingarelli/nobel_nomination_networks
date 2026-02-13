@@ -357,51 +357,40 @@ def render_network_page(df: pd.DataFrame, precomputed: dict | None = None,
     # Build the appropriate graph
     if network_type == "Nominator -> Nominee":
         G = build_nomination_graph(df, country=country_filter)
-        st.caption(f"{G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
-
-        if G.number_of_nodes() > 0:
-            stats = network_summary(G)
-            cols = st.columns(len(stats))
-            for i, (k, v) in enumerate(stats.items()):
-                cols[i % len(cols)].metric(k, v)
-
     elif network_type == "Co-nomination (shared nominators)":
         G = build_conomination_graph(df)
-        st.caption(f"{G.number_of_nodes()} nominees, {G.number_of_edges()} co-nomination links")
-
-        if G.number_of_nodes() > 0:
-            stats = network_summary(G)
-            cols = st.columns(min(len(stats), 4))
-            for i, (k, v) in enumerate(stats.items()):
-                cols[i % len(cols)].metric(k, v)
-
-        # Community detection
-        if G.number_of_nodes() > 0 and st.checkbox("Run community detection (Louvain)"):
-            try:
-                from networkx.algorithms.community import louvain_communities
-                communities = louvain_communities(G, weight="weight", seed=42)
-                for i, comm in enumerate(sorted(communities, key=len, reverse=True)[:10]):
-                    st.write(f"**Community {i+1}** ({len(comm)} members): {', '.join(sorted(comm)[:10])}{'...' if len(comm) > 10 else ''}")
-            except ImportError:
-                st.warning("Louvain requires networkx >= 2.8")
-
     elif is_cross_category:
         with st.spinner("Building cross-category combined network..."):
             G = build_combined_nomination_graph(combined_df, precomputed)
-        n_laureates = sum(1 for n in G.nodes if G.nodes[n].get("is_laureate", False))
-        st.caption(
-            f"{G.number_of_nodes()} nodes, {G.number_of_edges()} edges, "
-            f"{n_laureates} laureates (gold border)"
-        )
 
-        if G.number_of_nodes() > 0:
-            stats = network_summary(G)
-            cols = st.columns(min(len(stats), 4))
-            for i, (k, v) in enumerate(stats.items()):
-                cols[i % len(cols)].metric(k, v)
-
-    # Description + legend
+    # Render interactive visualization first
     if G.number_of_nodes() > 0:
+        color_mode = "category" if is_cross_category else "country"
+        html_path = visualize_graph(
+            G, title=network_type, min_edge_weight=min_weight, color_by=color_mode,
+        )
+        if html_path:
+            with open(html_path, "r") as f:
+                html_content = f.read()
+            st.components.v1.html(html_content, height=720, scrolling=True)
+            os.unlink(html_path)
+        else:
+            st.info("No edges meet the current filter criteria.")
+    else:
+        st.info("No data to display for current filters.")
+
+    # --- Everything below the figure ---
+    if G.number_of_nodes() > 0:
+        # Network stats
+        stats, name_stats = network_summary(G)
+        cols = st.columns(len(stats))
+        for i, (k, v) in enumerate(stats.items()):
+            cols[i].metric(k, v)
+        if name_stats:
+            for label, name in name_stats.items():
+                st.markdown(f"**{label}:** {name}")
+
+        # Description
         if network_type == "Nominator -> Nominee":
             st.markdown(
                 "**Directed graph**: arrows point from nominator to nominee. "
@@ -426,7 +415,6 @@ def render_network_page(df: pd.DataFrame, precomputed: dict | None = None,
 
         # Color legend
         if is_cross_category:
-            # Category-based legend
             categories_in_graph = set()
             for node in G.nodes:
                 c = G.nodes[node].get("category", "")
@@ -446,7 +434,6 @@ def render_network_page(df: pd.DataFrame, precomputed: dict | None = None,
                 unsafe_allow_html=True,
             )
         else:
-            # Country-based legend
             countries_in_graph = set()
             for node in G.nodes:
                 c = G.nodes[node].get("country", "Unknown")
@@ -464,19 +451,16 @@ def render_network_page(df: pd.DataFrame, precomputed: dict | None = None,
                     unsafe_allow_html=True,
                 )
 
-    # Render interactive visualization
-    if G.number_of_nodes() > 0:
-        color_mode = "category" if is_cross_category else "country"
-        html_path = visualize_graph(
-            G, title=network_type, min_edge_weight=min_weight, color_by=color_mode,
-        )
-        if html_path:
-            with open(html_path, "r") as f:
-                html_content = f.read()
-            st.components.v1.html(html_content, height=720, scrolling=True)
-            os.unlink(html_path)
-        else:
-            st.info("No edges meet the current filter criteria.")
+        # Community detection (co-nomination only)
+        if network_type == "Co-nomination (shared nominators)":
+            if st.checkbox("Run community detection (Louvain)"):
+                try:
+                    from networkx.algorithms.community import louvain_communities
+                    communities = louvain_communities(G, weight="weight", seed=42)
+                    for i, comm in enumerate(sorted(communities, key=len, reverse=True)[:10]):
+                        st.write(f"**Community {i+1}** ({len(comm)} members): {', '.join(sorted(comm)[:10])}{'...' if len(comm) > 10 else ''}")
+                except ImportError:
+                    st.warning("Louvain requires networkx >= 2.8")
 
     # --- Sidebar: Analysis options ---
     st.sidebar.divider()
@@ -592,29 +576,38 @@ def render_network_page(df: pd.DataFrame, precomputed: dict | None = None,
 # NETWORK STATISTICS
 # ---------------------------------------------------------------------------
 
-def network_summary(G: nx.Graph | nx.DiGraph) -> dict:
-    """Key network metrics for display."""
+def network_summary(G: nx.Graph | nx.DiGraph) -> tuple[dict, dict]:
+    """Key network metrics for display.
+
+    Returns (stats, name_stats) where stats are numeric metrics
+    suitable for st.metric and name_stats are name-based entries
+    displayed as markdown to avoid truncation.
+    """
     stats = {
         "Nodes": G.number_of_nodes(),
         "Edges": G.number_of_edges(),
         "Density": round(nx.density(G), 4),
     }
+    name_stats = {}
 
     if isinstance(G, nx.DiGraph):
         in_deg = sorted(G.in_degree(weight="weight"), key=lambda x: x[1], reverse=True)
         out_deg = sorted(G.out_degree(weight="weight"), key=lambda x: x[1], reverse=True)
-        stats["Most nominated"] = f"{in_deg[0][0]} ({in_deg[0][1]})" if in_deg else "N/A"
-        stats["Top nominator"] = f"{out_deg[0][0]} ({out_deg[0][1]})" if out_deg else "N/A"
+        if in_deg:
+            name_stats["Most nominated"] = f"{in_deg[0][0]} ({int(in_deg[0][1])})"
+        if out_deg:
+            name_stats["Top nominator"] = f"{out_deg[0][0]} ({int(out_deg[0][1])})"
     else:
         deg = sorted(G.degree(weight="weight"), key=lambda x: x[1], reverse=True)
-        stats["Most connected"] = f"{deg[0][0]} ({deg[0][1]})" if deg else "N/A"
+        if deg:
+            name_stats["Most connected"] = f"{deg[0][0]} ({int(deg[0][1])})"
 
         # Connected components
         components = list(nx.connected_components(G))
         stats["Components"] = len(components)
         stats["Largest component"] = len(max(components, key=len)) if components else 0
 
-    return stats
+    return stats, name_stats
 
 
 # ---------------------------------------------------------------------------
