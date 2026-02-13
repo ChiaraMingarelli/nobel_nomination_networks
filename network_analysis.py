@@ -41,6 +41,9 @@ def build_nomination_graph(df: pd.DataFrame,
     """
     filtered = _filter(df, category, year_range, country)
 
+    # Pre-compute nomination counts per nominee (O(n) instead of O(n²))
+    nominee_counts = filtered.groupby("nominee_name").size().to_dict()
+
     G = nx.DiGraph()
     for (nominator, nominee), group in filtered.groupby(["nominator_name", "nominee_name"]):
         weight = len(group)
@@ -57,9 +60,7 @@ def build_nomination_graph(df: pd.DataFrame,
             G.nodes[nominator]["country"] = row.get("nominator_country", "Unknown") if "nominator_country" in row.index else "Unknown"
         G.nodes[nominee]["role"] = "nominee"
         G.nodes[nominee]["country"] = group.iloc[0].get("nominee_country", "Unknown") if "nominee_country" in group.columns else "Unknown"
-        G.nodes[nominee]["total_nominations"] = filtered[
-            filtered["nominee_name"] == nominee
-        ].shape[0]
+        G.nodes[nominee]["total_nominations"] = nominee_counts.get(nominee, 0)
         if "nominee_prize_year" in group.columns:
             prize_year = group.iloc[0].get("nominee_prize_year")
             if pd.notna(prize_year):

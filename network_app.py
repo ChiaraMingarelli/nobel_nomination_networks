@@ -337,33 +337,40 @@ def enrich_with_country(df: pd.DataFrame, precomputed: dict) -> pd.DataFrame:
             if name_key and entry.get("Year Won"):
                 prize_year_by_name[name_key] = int(entry["Year Won"])
 
-    def lookup_country(row):
-        nominee_id = str(row.get("nominee_id", ""))
-        if nominee_id in country_by_id:
-            return country_by_id[nominee_id]
-        name = row.get("nominee_name", "").lower().strip()
-        if name in country_by_name:
-            return country_by_name[name]
-        for known_name, country in country_by_name.items():
-            if name and known_name and (name in known_name or known_name in name):
-                return country
-        return "Unknown"
+    # Build fast lookup: for each unique (nominee_id, nominee_name) pair,
+    # resolve country and prize_year once, then map back to all rows.
+    unique_nominees = df[["nominee_id", "nominee_name"]].drop_duplicates()
+    country_map = {}  # (nominee_id, nominee_name) -> country
+    prize_year_map = {}  # (nominee_id, nominee_name) -> prize_year
 
-    def lookup_prize_year(row):
-        nominee_id = str(row.get("nominee_id", ""))
-        if nominee_id in prize_year_by_id:
-            return prize_year_by_id[nominee_id]
+    for _, row in unique_nominees.iterrows():
+        nid = str(row.get("nominee_id", ""))
         name = row.get("nominee_name", "").lower().strip()
-        if name in prize_year_by_name:
-            return prize_year_by_name[name]
-        for known_name, year in prize_year_by_name.items():
-            if name and known_name and (name in known_name or known_name in name):
-                return year
-        return None
+        key = (nid, row.get("nominee_name", ""))
 
-    df["nominee_country"] = df.apply(lookup_country, axis=1)
+        # Country lookup: id -> exact name -> substring fallback
+        country = country_by_id.get(nid) or country_by_name.get(name)
+        if not country:
+            for known_name, c in country_by_name.items():
+                if name and known_name and (name in known_name or known_name in name):
+                    country = c
+                    break
+        country_map[key] = country or "Unknown"
+
+        # Prize year lookup: id -> exact name -> substring fallback
+        py = prize_year_by_id.get(nid) or prize_year_by_name.get(name)
+        if py is None:
+            for known_name, y in prize_year_by_name.items():
+                if name and known_name and (name in known_name or known_name in name):
+                    py = y
+                    break
+        prize_year_map[key] = py
+
+    # Vectorized assignment via map
+    lookup_keys = list(zip(df["nominee_id"].astype(str), df["nominee_name"]))
+    df["nominee_country"] = [country_map.get((nid, nm), "Unknown") for nid, nm in lookup_keys]
     df["nominator_country"] = "Unknown"
-    df["nominee_prize_year"] = df.apply(lookup_prize_year, axis=1)
+    df["nominee_prize_year"] = [prize_year_map.get((nid, nm)) for nid, nm in lookup_keys]
 
     return df
 
