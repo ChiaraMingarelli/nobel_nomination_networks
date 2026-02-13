@@ -2347,10 +2347,13 @@ def _render_advanced_analyses(combined_df, cat_combined, precomputed, flags):
             # Top near-misses
             st.markdown("#### Top 20 Near-Misses by Nomination Count")
             st.dataframe(result["top_near_misses"], hide_index=True)
-            _csv_download_button(result["near_miss_table"], "near_misses.csv",
-                                 key="near_miss_csv")
-            _csv_download_button(result["winner_table"], "comparable_winners.csv",
-                                 key="winners_csv")
+            dl1, dl2 = st.columns(2)
+            with dl1:
+                _csv_download_button(result["near_miss_table"], "near_misses.csv",
+                                     key="near_miss_csv")
+            with dl2:
+                _csv_download_button(result["winner_table"], "comparable_winners.csv",
+                                     key="winners_csv")
         else:
             st.info("Click **Run Near-Miss Analysis** in the sidebar.")
 
@@ -2529,10 +2532,13 @@ def _render_advanced_analyses(combined_df, cat_combined, precomputed, flags):
                 display_cols = ["name", "total_noms", "won", "campaign_noms",
                                 "campaign_years", "baseline_rate", "burst_rate"]
                 st.dataframe(ct[display_cols], hide_index=True)
-                _csv_download_button(ct, "campaign_nominees.csv",
-                                     key="campaign_success_csv")
-                _csv_download_button(result["control_table"], "matched_controls.csv",
-                                     key="control_csv")
+                dl1, dl2 = st.columns(2)
+                with dl1:
+                    _csv_download_button(ct, "campaign_nominees.csv",
+                                         key="campaign_success_csv")
+                with dl2:
+                    _csv_download_button(result["control_table"], "matched_controls.csv",
+                                         key="control_csv")
         else:
             st.info("Click **Run Campaign Success Analysis** in the sidebar.")
 
