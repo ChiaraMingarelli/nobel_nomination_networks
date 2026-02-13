@@ -11,6 +11,7 @@ Dependencies: pip install networkx pyvis pandas streamlit
 """
 
 import networkx as nx
+import numpy as np
 import pandas as pd
 from pyvis.network import Network
 from collections import defaultdict
@@ -86,29 +87,43 @@ def build_conomination_graph(df: pd.DataFrame,
 
     # For each nominator, collect the set of nominees they proposed
     nominator_to_nominees = defaultdict(set)
-    for _, row in filtered.iterrows():
-        nominator_to_nominees[row["nominator_name"]].add(row["nominee_name"])
+    for row in filtered.itertuples(index=False):
+        nominator_to_nominees[row.nominator_name].add(row.nominee_name)
 
-    # Build edges: for each nominator who proposed >1 nominee, link all pairs
+    # Build edges: for each nominator who proposed >1 nominee, link all pairs.
+    # Cap at 50 nominees per nominator to avoid O(n^2) blowup for
+    # institutional/committee nominators.
+    MAX_NOMINEES_PER_NOMINATOR = 50
     G = nx.Graph()
     edge_weights = defaultdict(int)
     for nominator, nominees in nominator_to_nominees.items():
         nominees = sorted(nominees)
+        if len(nominees) > MAX_NOMINEES_PER_NOMINATOR:
+            continue  # skip institutional nominators
         for i in range(len(nominees)):
             for j in range(i + 1, len(nominees)):
                 edge_weights[(nominees[i], nominees[j])] += 1
 
-    # Add nominee metadata
+    # Add nominee metadata — use vectorized groupby instead of iterrows
     nominee_countries = {}
     nominee_prize_years = {}
     nominee_counts = filtered.groupby("nominee_name").size().to_dict()
-    for _, row in filtered.iterrows():
-        if "nominee_country" in row.index:
-            nominee_countries[row["nominee_name"]] = row.get("nominee_country", "Unknown")
-        if "nominee_prize_year" in row.index:
-            py = row.get("nominee_prize_year")
-            if pd.notna(py):
-                nominee_prize_years[row["nominee_name"]] = int(py)
+    if "nominee_country" in filtered.columns:
+        nominee_countries = (
+            filtered.dropna(subset=["nominee_country"])
+            .groupby("nominee_name")["nominee_country"]
+            .first()
+            .to_dict()
+        )
+    if "nominee_prize_year" in filtered.columns:
+        prize_rows = filtered.dropna(subset=["nominee_prize_year"])
+        if len(prize_rows) > 0:
+            nominee_prize_years = (
+                prize_rows.groupby("nominee_name")["nominee_prize_year"]
+                .first()
+                .astype(int)
+                .to_dict()
+            )
 
     for (n1, n2), weight in edge_weights.items():
         G.add_edge(n1, n2, weight=weight)
@@ -165,6 +180,10 @@ def detect_campaigns(df: pd.DataFrame,
     clusters of nominations for the same nominee within a short time window,
     especially from nominators at the same institution.
 
+    Overlapping windows for the same nominee are merged: for each burst of
+    overlapping qualifying windows, only the window with the maximum nomination
+    count is reported.
+
     Returns a DataFrame of suspected campaigns with stats.
     """
     filtered = df.copy()
@@ -177,20 +196,47 @@ def detect_campaigns(df: pd.DataFrame,
         if len(years) == 0:
             continue
 
-        # Sliding window: find bursts
+        # Sliding window: find all qualifying bursts
+        raw_windows = []
         for start_year in range(int(years.min()), int(years.max()) - year_window + 2):
             end_year = start_year + year_window - 1
             window = group[(group["year"] >= start_year) & (group["year"] <= end_year)]
             if len(window) >= min_nominations:
                 nominators = window["nominator_name"].unique()
-                campaigns.append({
-                    "nominee": nominee,
+                raw_windows.append({
                     "year_start": start_year,
                     "year_end": end_year,
                     "n_nominations": len(window),
                     "n_unique_nominators": len(nominators),
                     "nominators": list(nominators),
                 })
+
+        # Merge overlapping windows: group consecutive overlapping windows
+        # and keep only the one with the max nomination count per burst.
+        if not raw_windows:
+            continue
+
+        bursts = []
+        current_burst = [raw_windows[0]]
+        for w in raw_windows[1:]:
+            # Overlapping if this window's start <= previous window's end
+            if w["year_start"] <= current_burst[-1]["year_end"]:
+                current_burst.append(w)
+            else:
+                bursts.append(current_burst)
+                current_burst = [w]
+        bursts.append(current_burst)
+
+        for burst in bursts:
+            best = max(burst, key=lambda w: w["n_nominations"])
+            campaigns.append({
+                "nominee": nominee,
+                "year_start": best["year_start"],
+                "year_end": best["year_end"],
+                "n_nominations": best["n_nominations"],
+                "n_unique_nominators": best["n_unique_nominators"],
+                "nominators": best["nominators"],
+            })
 
     if not campaigns:
         return pd.DataFrame(columns=["nominee", "year_start", "year_end",
@@ -507,6 +553,44 @@ def render_network_page(df: pd.DataFrame, precomputed: dict | None = None,
         run_lcc = st.sidebar.button("Run LCC Analysis", key="lcc_btn")
     show_raw = st.sidebar.checkbox("Raw Edge Data", key="show_raw")
 
+    # --- Advanced Analyses ---
+    st.sidebar.divider()
+    st.sidebar.header("Advanced Analyses")
+
+    adv_options = ["None"]
+    if has_combined:
+        adv_options.append("Temporal Evolution")
+    if has_combined and has_precomputed:
+        adv_options.extend([
+            "Three Degrees of Influence",
+            "Near-Miss Analysis",
+            "Centrality Predicts Winners",
+        ])
+
+    adv_selection = st.sidebar.selectbox(
+        "Select analysis", adv_options, key="adv_analysis_select")
+
+    show_centrality = adv_selection == "Centrality Predicts Winners"
+    show_near_miss = adv_selection == "Near-Miss Analysis"
+    show_temporal = adv_selection == "Temporal Evolution"
+    show_proximity = adv_selection == "Three Degrees of Influence"
+
+    run_centrality = False
+    run_near_miss = False
+    run_temporal = False
+    run_proximity = False
+    near_miss_min = 10
+
+    if show_centrality:
+        run_centrality = st.sidebar.button("Run Centrality Analysis", key="centrality_btn")
+    elif show_near_miss:
+        near_miss_min = st.sidebar.slider("Min nominations", 5, 30, 10, key="near_miss_min")
+        run_near_miss = st.sidebar.button("Run Near-Miss Analysis", key="near_miss_btn")
+    elif show_temporal:
+        run_temporal = st.sidebar.button("Run Evolution Analysis", key="temporal_btn")
+    elif show_proximity:
+        run_proximity = st.sidebar.button("Run Proximity Analysis", key="proximity_btn")
+
     # --- Main area: render selected analyses ---
 
     if show_campaigns and run_campaigns:
@@ -598,6 +682,23 @@ def render_network_page(df: pd.DataFrame, precomputed: dict | None = None,
         st.subheader("Raw Edge Data")
         st.dataframe(df, hide_index=True)
         _csv_download_button(df, "nomination_edges.csv", key="raw_edges_csv")
+
+    # --- Advanced Analyses ---
+    if has_combined and adv_selection != "None":
+        adv_flags = {
+            "show_centrality": show_centrality,
+            "run_centrality": run_centrality,
+            "show_near_miss": show_near_miss,
+            "run_near_miss": run_near_miss,
+            "near_miss_min": near_miss_min,
+            "show_temporal": show_temporal,
+            "run_temporal": run_temporal,
+            "show_proximity": show_proximity,
+            "run_proximity": run_proximity,
+        }
+        st.divider()
+        st.header("Advanced Network Analyses")
+        _render_advanced_analyses(combined_df, precomputed, adv_flags)
 
 
 # ---------------------------------------------------------------------------
@@ -789,13 +890,14 @@ def compute_endorsement_effect(df: pd.DataFrame, precomputed: dict) -> dict:
     # For each unique nominee, track: endorsed by a laureate? did they win?
     nominee_info = {}  # nominee_name -> {endorsed: bool, won: bool}
 
-    for _, row in df.iterrows():
-        nominee = row["nominee_name"]
-        nom_year = row["year"]
-        nominator = row["nominator_name"]
+    has_prize_col = "nominee_prize_year" in df.columns
+    for row in df.itertuples(index=False):
+        nominee = row.nominee_name
+        nom_year = row.year
+        nominator = row.nominator_name
 
         if nominee not in nominee_info:
-            won = pd.notna(row.get("nominee_prize_year")) if "nominee_prize_year" in row.index else False
+            won = has_prize_col and pd.notna(row.nominee_prize_year)
             nominee_info[nominee] = {"endorsed": False, "won": bool(won)}
 
         # Check if this nominator was a laureate who won before this nomination
@@ -839,10 +941,10 @@ def build_combined_nomination_graph(df: pd.DataFrame, precomputed: dict) -> nx.G
     edge_weights = defaultdict(int)
     node_categories = defaultdict(lambda: defaultdict(int))  # node -> {category: count}
 
-    for _, row in df.iterrows():
-        nominator = row["nominator_name"]
-        nominee = row["nominee_name"]
-        cat = row.get("category", "Unknown")
+    for row in df.itertuples(index=False):
+        nominator = row.nominator_name
+        nominee = row.nominee_name
+        cat = getattr(row, "category", "Unknown") or "Unknown"
 
         edge_weights[(nominator, nominee)] += 1
         node_categories[nominee][cat] += 1
@@ -886,8 +988,10 @@ def compute_lcc_analysis(G: nx.Graph, precomputed: dict, n_permutations: int = 1
     Counts unique laureate IDs (not nodes) to avoid inflating the count when the
     same person appears under multiple name spellings.
 
-    Null model: randomly pick n_unique_laureates nodes from the graph,
-    count how many land in the LCC, repeat 1000 times.
+    Null model: randomly sample n_laureates from *nominee nodes only* (nodes
+    that appear as nominees, i.e. have the "role" attribute set to "nominee" or
+    appear in the nominee column). Laureates are nominees, not random nodes, so
+    sampling from all nodes would undercount the expected LCC overlap.
 
     Returns dict with observed count, expected mean/std, z-score, and sizes.
     """
@@ -919,13 +1023,30 @@ def compute_lcc_analysis(G: nx.Graph, precomputed: dict, n_permutations: int = 1
     lids_in_lcc = {node_to_lid[n] for n in node_to_lid if n in lcc}
     observed = len(lids_in_lcc)
 
-    # Null model: randomly pick n_laureates nodes, count how many land in LCC
-    all_nodes = list(G.nodes)
+    # Build nominee-only node pool for the null model.
+    # Nominees are identified by role attribute (set by build_nomination_graph)
+    # or by is_laureate attribute (set by build_combined_nomination_graph).
+    # Fallback: any node that has total_nominations > 0 or is a laureate.
+    nominee_nodes = []
+    for node in G.nodes:
+        data = G.nodes[node]
+        if data.get("role") == "nominee":
+            nominee_nodes.append(node)
+        elif data.get("is_laureate"):
+            nominee_nodes.append(node)
+        elif data.get("total_nominations", 0) > 0:
+            nominee_nodes.append(node)
+
+    # Ensure pool is at least as large as the number of laureates
+    if len(nominee_nodes) < n_laureates:
+        nominee_nodes = list(G.nodes)  # fall back to all nodes
+
+    lcc_set = set(lcc)
     rng = random.Random(42)
     null_counts = []
     for _ in range(n_permutations):
-        random_picks = set(rng.sample(all_nodes, n_laureates))
-        null_counts.append(len(random_picks & lcc))
+        random_picks = set(rng.sample(nominee_nodes, min(n_laureates, len(nominee_nodes))))
+        null_counts.append(len(random_picks & lcc_set))
 
     expected_mean = sum(null_counts) / len(null_counts)
     variance = sum((x - expected_mean) ** 2 for x in null_counts) / len(null_counts)
@@ -944,4 +1065,1093 @@ def compute_lcc_analysis(G: nx.Graph, precomputed: dict, n_permutations: int = 1
         "lcc_size": lcc_size,
         "graph_size": graph_size,
         "n_laureates": n_laureates,
+        "null_pool_size": len(nominee_nodes),
     }
+
+
+# ---------------------------------------------------------------------------
+# ANALYSIS 4: TEMPORAL NETWORK EVOLUTION
+# ---------------------------------------------------------------------------
+
+class _UnionFind:
+    """Incremental union-find for tracking connected component sizes."""
+
+    def __init__(self):
+        self._parent = {}
+        self._rank = {}
+        self._size = {}  # size of component rooted at each root
+        self._max_size = 0
+        self._n_components = 0
+
+    def add(self, x):
+        if x not in self._parent:
+            self._parent[x] = x
+            self._rank[x] = 0
+            self._size[x] = 1
+            self._n_components += 1
+            if 1 > self._max_size:
+                self._max_size = 1
+
+    def find(self, x):
+        root = x
+        while self._parent[root] != root:
+            root = self._parent[root]
+        while self._parent[x] != root:
+            self._parent[x], x = root, self._parent[x]
+        return root
+
+    def union(self, x, y):
+        self.add(x)
+        self.add(y)
+        rx, ry = self.find(x), self.find(y)
+        if rx == ry:
+            return
+        if self._rank[rx] < self._rank[ry]:
+            rx, ry = ry, rx
+        self._parent[ry] = rx
+        self._size[rx] += self._size[ry]
+        if self._rank[rx] == self._rank[ry]:
+            self._rank[rx] += 1
+        self._n_components -= 1
+        if self._size[rx] > self._max_size:
+            self._max_size = self._size[rx]
+
+    @property
+    def n_nodes(self):
+        return len(self._parent)
+
+    @property
+    def n_components(self):
+        return self._n_components
+
+    @property
+    def gcc_size(self):
+        return self._max_size
+
+
+def compute_temporal_evolution(combined_df: pd.DataFrame) -> dict:
+    """
+    How do network properties evolve year by year?
+
+    Builds cumulative undirected nomination graphs incrementally from 1901
+    to 1970 and computes structural metrics at each year. Uses an incremental
+    union-find for O(alpha(n)) connected-component tracking instead of
+    recomputing components from scratch each year.
+
+    Returns dict with:
+      - overall: DataFrame indexed by year with network metrics
+      - by_category: dict {category: DataFrame} with per-category metrics
+      - category_list: list of categories present
+    """
+    df = combined_df.copy()
+    df = df.dropna(subset=["year"])
+    df["year"] = df["year"].astype(int)
+
+    min_year = max(1901, df["year"].min())
+    max_year = min(1970, df["year"].max())
+    years = list(range(min_year, max_year + 1))
+
+    categories = sorted(df["category"].dropna().unique())
+
+    # --- Overall cumulative graph ---
+    G = nx.Graph()
+    uf = _UnionFind()
+    overall_rows = []
+    edges_by_year = df.groupby("year")
+
+    for yr in years:
+        if yr in edges_by_year.groups:
+            year_df = edges_by_year.get_group(yr)
+            for row in year_df.itertuples(index=False):
+                n1, n2 = row.nominator_name, row.nominee_name
+                if G.has_edge(n1, n2):
+                    G[n1][n2]["weight"] += 1
+                else:
+                    G.add_edge(n1, n2, weight=1)
+                uf.union(n1, n2)
+
+        n_nodes = G.number_of_nodes()
+        n_edges = G.number_of_edges()
+
+        if n_nodes > 0:
+            gcc_size = uf.gcc_size
+            gcc_frac = gcc_size / n_nodes
+            n_components = uf.n_components
+            mean_degree = 2 * n_edges / n_nodes
+            # Clustering is expensive for large graphs — sample for speed
+            if n_nodes > 5000:
+                sample_nodes = random.sample(list(G.nodes), min(2000, n_nodes))
+                clustering = nx.average_clustering(G, nodes=sample_nodes)
+            else:
+                clustering = nx.average_clustering(G)
+        else:
+            gcc_size = gcc_frac = clustering = mean_degree = 0
+            n_components = 0
+
+        overall_rows.append({
+            "year": yr,
+            "nodes": n_nodes,
+            "edges": n_edges,
+            "gcc_size": gcc_size,
+            "gcc_frac": round(gcc_frac, 4),
+            "clustering": round(clustering, 4),
+            "mean_degree": round(mean_degree, 3),
+            "n_components": n_components,
+        })
+
+    overall = pd.DataFrame(overall_rows).set_index("year")
+
+    # --- Per-category cumulative graphs ---
+    by_category = {}
+    for cat in categories:
+        cat_df = df[df["category"] == cat]
+        cat_edges_by_year = cat_df.groupby("year")
+        G_cat = nx.Graph()
+        uf_cat = _UnionFind()
+        cat_rows = []
+
+        for yr in years:
+            if yr in cat_edges_by_year.groups:
+                year_df = cat_edges_by_year.get_group(yr)
+                for row in year_df.itertuples(index=False):
+                    n1, n2 = row.nominator_name, row.nominee_name
+                    if G_cat.has_edge(n1, n2):
+                        G_cat[n1][n2]["weight"] += 1
+                    else:
+                        G_cat.add_edge(n1, n2, weight=1)
+                    uf_cat.union(n1, n2)
+
+            n_nodes = G_cat.number_of_nodes()
+            n_edges = G_cat.number_of_edges()
+
+            if n_nodes > 1:
+                gcc_size = uf_cat.gcc_size
+                gcc_frac = gcc_size / n_nodes
+                mean_degree = 2 * n_edges / n_nodes
+            elif n_nodes == 1:
+                gcc_size = 1
+                gcc_frac = 1.0
+                mean_degree = 0
+            else:
+                gcc_size = gcc_frac = mean_degree = 0
+
+            cat_rows.append({
+                "year": yr,
+                "nodes": n_nodes,
+                "edges": n_edges,
+                "gcc_size": gcc_size,
+                "gcc_frac": round(gcc_frac, 4),
+                "mean_degree": round(mean_degree, 3),
+            })
+
+        by_category[cat] = pd.DataFrame(cat_rows).set_index("year")
+
+    return {
+        "overall": overall,
+        "by_category": by_category,
+        "category_list": categories,
+    }
+
+
+# ---------------------------------------------------------------------------
+# ANALYSIS 5: THREE DEGREES OF INFLUENCE (PROXIMITY EFFECT)
+# ---------------------------------------------------------------------------
+
+def compute_proximity_effect(combined_df: pd.DataFrame, precomputed: dict) -> dict:
+    """
+    In the co-nomination network, does proximity to a past laureate predict winning?
+
+    Builds undirected co-nomination graph, computes shortest-path distances from
+    each non-laureate nominee to the nearest laureate who won before the nominee's
+    first nomination year. Uses first (not last) year to avoid time-period bias:
+    early nominees have few past laureates while late nominees have many, creating
+    a mechanical correlation. Results are also stratified by decade.
+
+    Returns dict with:
+      - by_distance: DataFrame [distance, n_nominees, n_won, win_rate]
+      - by_decade: dict {decade_str: DataFrame} with same structure
+      - overall_reachable_rate: float
+      - unreachable_rate: float
+    """
+    laureate_lookup = build_laureate_lookup(precomputed)
+
+    # Build co-nomination graph
+    G = build_conomination_graph(combined_df)
+
+    # Identify laureate nodes and their win years
+    laureate_nodes = {}  # node -> year_won
+    for node in G.nodes:
+        laureate = match_nominator_to_laureate(node, laureate_lookup)
+        if laureate:
+            laureate_nodes[node] = laureate["year_won"]
+
+    # For each nominee, find their FIRST nomination year (more conservative
+    # reference point — avoids inflating the set of "past laureates" for
+    # nominees with long careers spanning many decades).
+    nominee_first_year = {}
+    nominee_won = {}
+    for row in combined_df.itertuples(index=False):
+        name = row.nominee_name
+        yr = int(row.year)
+        if name in G.nodes:
+            if name not in nominee_first_year or yr < nominee_first_year[name]:
+                nominee_first_year[name] = yr
+            if hasattr(row, "nominee_prize_year") and pd.notna(row.nominee_prize_year):
+                nominee_won[name] = True
+
+    # Compute shortest-path distance to nearest past laureate for each non-laureate
+    # Key structure: (distance_bucket, decade) -> {n, won}
+    bucket_counts = defaultdict(lambda: {"n": 0, "won": 0})
+
+    non_laureate_nodes = [n for n in G.nodes if n not in laureate_nodes]
+
+    for node in non_laureate_nodes:
+        first_yr = nominee_first_year.get(node, 9999)
+        decade = f"{(first_yr // 10) * 10}s"
+
+        # Find past laureates (won strictly before this nominee's first nomination)
+        past_laureates = {ln for ln, yw in laureate_nodes.items() if yw < first_yr}
+        if not past_laureates:
+            bucket_counts[("unreachable", decade)]["n"] += 1
+            bucket_counts[("unreachable", "all")]["n"] += 1
+            if node in nominee_won:
+                bucket_counts[("unreachable", decade)]["won"] += 1
+                bucket_counts[("unreachable", "all")]["won"] += 1
+            continue
+
+        # BFS from node to find nearest past laureate
+        try:
+            min_dist = None
+            lengths = nx.single_source_shortest_path_length(G, node, cutoff=5)
+            for target, dist in lengths.items():
+                if target in past_laureates:
+                    if min_dist is None or dist < min_dist:
+                        min_dist = dist
+        except nx.NetworkXError:
+            min_dist = None
+
+        if min_dist is None:
+            bucket = "unreachable"
+        elif min_dist <= 3:
+            bucket = str(min_dist)
+        else:
+            bucket = "4+"
+
+        bucket_counts[(bucket, decade)]["n"] += 1
+        bucket_counts[(bucket, "all")]["n"] += 1
+        if node in nominee_won:
+            bucket_counts[(bucket, decade)]["won"] += 1
+            bucket_counts[(bucket, "all")]["won"] += 1
+
+    # Build overall results table
+    dist_labels = ["1", "2", "3", "4+", "unreachable"]
+
+    def _build_table(period):
+        rows = []
+        for d in dist_labels:
+            data = bucket_counts[(d, period)]
+            n = data["n"]
+            won = data["won"]
+            rows.append({
+                "distance": d,
+                "n_nominees": n,
+                "n_won": won,
+                "win_rate": round(won / n, 4) if n > 0 else 0,
+            })
+        return pd.DataFrame(rows)
+
+    by_distance = _build_table("all")
+
+    # Per-decade tables
+    decades = sorted({d for (_, d) in bucket_counts if d != "all"})
+    by_decade = {}
+    for dec in decades:
+        dec_table = _build_table(dec)
+        if dec_table["n_nominees"].sum() > 0:
+            by_decade[dec] = dec_table
+
+    reachable = by_distance[by_distance["distance"] != "unreachable"]
+    unreachable = by_distance[by_distance["distance"] == "unreachable"]
+
+    reachable_total = reachable["n_nominees"].sum()
+    reachable_won = reachable["n_won"].sum()
+    overall_reachable_rate = reachable_won / reachable_total if reachable_total > 0 else 0
+
+    unreachable_total = unreachable["n_nominees"].sum()
+    unreachable_won = unreachable["n_won"].sum()
+    unreachable_rate_val = unreachable_won / unreachable_total if unreachable_total > 0 else 0
+
+    return {
+        "by_distance": by_distance,
+        "by_decade": by_decade,
+        "overall_reachable_rate": round(overall_reachable_rate, 4),
+        "unreachable_rate": round(unreachable_rate_val, 4),
+    }
+
+
+# ---------------------------------------------------------------------------
+# ANALYSIS 6: NEAR-MISS ANALYSIS
+# ---------------------------------------------------------------------------
+
+def compute_near_miss_analysis(combined_df: pd.DataFrame, precomputed: dict,
+                               min_nominations: int = 10) -> dict:
+    """
+    Do winners and 'near misses' (heavily nominated but never won) have
+    structurally different nomination neighborhoods?
+
+    For each person, computes:
+      - Support breadth: number of unique nominators
+      - Nominator reach: mean degree of their nominators in the nomination graph
+      - Concentration: Herfindahl index of nominator contributions
+      - Nominator diversity: number of unique communities among nominators
+
+    Returns dict with near_miss_table, winner_table, comparison stats, top_near_misses.
+    """
+    from scipy.stats import mannwhitneyu
+
+    laureate_lookup = build_laureate_lookup(precomputed)
+
+    # Aggregate per nominee: total nominations, unique nominators, won?
+    nominee_stats = {}
+    nominator_counts_per_nominee = defaultdict(lambda: defaultdict(int))
+
+    has_prize_col = "nominee_prize_year" in combined_df.columns
+    for row in combined_df.itertuples(index=False):
+        nominee = row.nominee_name
+        nominator = row.nominator_name
+        nominator_counts_per_nominee[nominee][nominator] += 1
+
+        if nominee not in nominee_stats:
+            won = has_prize_col and pd.notna(row.nominee_prize_year)
+            nominee_stats[nominee] = {"won": bool(won), "total_noms": 0}
+        nominee_stats[nominee]["total_noms"] += 1
+
+    # Build nomination graph for computing nominator degrees
+    G = build_nomination_graph(combined_df)
+
+    # Build nominator co-activity graph: two nominators are linked if they
+    # nominated any of the same people. This is the correct space for measuring
+    # how many independent communities support a given nominee.
+    nominator_to_nominees = defaultdict(set)
+    for row in combined_df.itertuples(index=False):
+        nominator_to_nominees[row.nominator_name].add(row.nominee_name)
+
+    G_nom = nx.Graph()
+    # Invert: for each nominee, link all pairs of their nominators
+    nominee_to_nominators = defaultdict(set)
+    for nominator, nominees in nominator_to_nominees.items():
+        for nom in nominees:
+            nominee_to_nominators[nom].add(nominator)
+
+    nom_coact_edges = defaultdict(int)
+    for nom, nominators in nominee_to_nominators.items():
+        nominators = sorted(nominators)
+        for i in range(len(nominators)):
+            for j in range(i + 1, len(nominators)):
+                nom_coact_edges[(nominators[i], nominators[j])] += 1
+    for (n1, n2), w in nom_coact_edges.items():
+        G_nom.add_edge(n1, n2, weight=w)
+
+    # Identify near-misses and comparable winners
+    near_misses = []
+    winners = []
+    for name, info in nominee_stats.items():
+        if info["total_noms"] >= min_nominations:
+            if not info["won"]:
+                near_misses.append(name)
+            else:
+                winners.append(name)
+
+    def compute_metrics(person_list):
+        """Compute network metrics for a list of nominees."""
+        rows = []
+        for name in person_list:
+            nom_counts = nominator_counts_per_nominee[name]
+            total_noms = sum(nom_counts.values())
+            breadth = len(nom_counts)
+
+            # Nominator reach: mean degree of nominators in the full graph
+            nominator_degrees = []
+            for nominator in nom_counts:
+                if nominator in G:
+                    nominator_degrees.append(G.degree(nominator, weight="weight"))
+            reach = np.mean(nominator_degrees) if nominator_degrees else 0
+
+            # Herfindahl index: sum of squared shares
+            if total_noms > 0:
+                shares = [c / total_noms for c in nom_counts.values()]
+                concentration = sum(s ** 2 for s in shares)
+            else:
+                concentration = 1.0
+
+            # Nominator diversity: Louvain communities among this person's
+            # nominators in the nominator co-activity graph (nominators linked
+            # if they nominated any of the same people).
+            nominator_set = set(nom_counts.keys())
+            nominator_subgraph_nodes = [n for n in nominator_set if n in G_nom]
+            if len(nominator_subgraph_nodes) > 2:
+                sub = G_nom.subgraph(nominator_subgraph_nodes)
+                if sub.number_of_edges() > 0:
+                    try:
+                        from networkx.algorithms.community import louvain_communities
+                        communities = louvain_communities(sub, seed=42)
+                        diversity = len(communities)
+                    except Exception:
+                        diversity = len(nominator_subgraph_nodes)
+                else:
+                    diversity = len(nominator_subgraph_nodes)
+            else:
+                diversity = max(len(nominator_subgraph_nodes), len(nominator_set))
+
+            rows.append({
+                "name": name,
+                "total_noms": total_noms,
+                "breadth": breadth,
+                "diversity": diversity,
+                "reach": round(reach, 2),
+                "concentration": round(concentration, 4),
+            })
+        return pd.DataFrame(rows)
+
+    near_miss_table = compute_metrics(near_misses)
+    winner_table = compute_metrics(winners)
+
+    # Statistical comparison: Mann-Whitney U for each metric
+    comparison = {}
+    for metric in ["breadth", "diversity", "reach", "concentration"]:
+        w_vals = winner_table[metric].values if len(winner_table) > 0 else np.array([])
+        nm_vals = near_miss_table[metric].values if len(near_miss_table) > 0 else np.array([])
+
+        if len(w_vals) > 0 and len(nm_vals) > 0:
+            u_stat, p_val = mannwhitneyu(w_vals, nm_vals, alternative="two-sided")
+            comparison[metric] = {
+                "winner_mean": round(float(np.mean(w_vals)), 3),
+                "near_miss_mean": round(float(np.mean(nm_vals)), 3),
+                "u_stat": round(float(u_stat), 1),
+                "p_value": float(p_val),
+            }
+        else:
+            comparison[metric] = {
+                "winner_mean": 0, "near_miss_mean": 0,
+                "u_stat": 0, "p_value": 1.0,
+            }
+
+    # Top near-misses by nomination count
+    top_near_misses = near_miss_table.sort_values("total_noms", ascending=False).head(20)
+
+    return {
+        "near_miss_table": near_miss_table,
+        "winner_table": winner_table,
+        "comparison": comparison,
+        "top_near_misses": top_near_misses,
+        "n_near_misses": len(near_misses),
+        "n_winners": len(winners),
+    }
+
+
+# ---------------------------------------------------------------------------
+# ANALYSIS 7: CENTRALITY PREDICTS WINNERS
+# ---------------------------------------------------------------------------
+
+def compute_centrality_prediction(combined_df: pd.DataFrame, precomputed: dict) -> dict:
+    """
+    Does network position at time t predict winning at t+k?
+
+    Builds cumulative directed nomination graphs at 5-year snapshots, computes
+    centrality metrics for each nominee, and runs logistic regression to compare
+    AUC-ROC of in-degree-only vs full-centrality models.
+
+    CV uses leave-one-snapshot-out to respect temporal structure and avoid
+    leaking information across correlated observations of the same nominee.
+
+    Returns dict with AUC scores, coefficients, feature table, and ROC data.
+    """
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.metrics import roc_curve, auc
+
+    laureate_lookup = build_laureate_lookup(precomputed)
+
+    df = combined_df.copy()
+    df = df.dropna(subset=["year"])
+    df["year"] = df["year"].astype(int)
+
+    snapshot_years = list(range(1910, 1970, 5))
+    all_observations = []
+
+    # Build cumulative graph incrementally — track the frontier year to avoid
+    # re-processing edges that were already added at earlier snapshots.
+    G = nx.DiGraph()
+    edges_by_year = df.groupby("year")
+    all_years = sorted(df["year"].unique())
+    frontier = 0  # index into all_years: everything before this is already in G
+
+    for snap_year in snapshot_years:
+        # Add edges from frontier up to snap_year
+        while frontier < len(all_years) and all_years[frontier] <= snap_year:
+            yr = all_years[frontier]
+            if yr in edges_by_year.groups:
+                year_df = edges_by_year.get_group(yr)
+                for row in year_df.itertuples(index=False):
+                    n1, n2 = row.nominator_name, row.nominee_name
+                    if G.has_edge(n1, n2):
+                        G[n1][n2]["weight"] += 1
+                    else:
+                        G.add_edge(n1, n2, weight=1)
+            frontier += 1
+
+        if G.number_of_nodes() < 10:
+            continue
+
+        # Compute centrality measures for nominees (nodes with in-degree > 0)
+        nominees_in_graph = [n for n in G.nodes if G.in_degree(n) > 0]
+        if len(nominees_in_graph) < 10:
+            continue
+
+        # Weighted in-degree
+        in_degrees = dict(G.in_degree(weight="weight"))
+
+        # PageRank (weighted)
+        try:
+            pagerank = nx.pagerank(G, weight="weight", max_iter=100)
+        except nx.PowerIterationFailedConvergence:
+            pagerank = {n: 1.0 / G.number_of_nodes() for n in G.nodes}
+
+        # Betweenness centrality (approximate)
+        k_sample = min(200, G.number_of_nodes())
+        betweenness = nx.betweenness_centrality(G, k=k_sample, weight="weight", seed=42)
+
+        # Eigenvector centrality (on undirected version for convergence)
+        G_undirected = G.to_undirected()
+        try:
+            eigenvector = nx.eigenvector_centrality(G_undirected, weight="weight", max_iter=200)
+        except nx.PowerIterationFailedConvergence:
+            eigenvector = {n: 0.0 for n in G.nodes}
+
+        for nominee in nominees_in_graph:
+            # Label: won within 10 years after snapshot?
+            won = 0
+            laureate = match_nominator_to_laureate(nominee, laureate_lookup)
+            if laureate and snap_year < laureate["year_won"] <= snap_year + 10:
+                won = 1
+
+            all_observations.append({
+                "snapshot": snap_year,
+                "nominee": nominee,
+                "in_degree": in_degrees.get(nominee, 0),
+                "pagerank": pagerank.get(nominee, 0),
+                "betweenness": betweenness.get(nominee, 0),
+                "eigenvector": eigenvector.get(nominee, 0),
+                "won": won,
+            })
+
+    if not all_observations:
+        return {"error": "Not enough data for centrality prediction"}
+
+    feature_table = pd.DataFrame(all_observations)
+    feature_names = ["in_degree", "pagerank", "betweenness", "eigenvector"]
+
+    # --- Leave-one-snapshot-out CV ---
+    # Each fold holds out one snapshot for testing and trains on the rest.
+    # This respects temporal structure and avoids the same nominee appearing
+    # in both train and test at the same snapshot.
+    snapshots_present = sorted(feature_table["snapshot"].unique())
+
+    if len(snapshots_present) < 3:
+        return {"error": f"Only {len(snapshots_present)} snapshots with data — need at least 3 for CV"}
+
+    y_true_all = []
+    y_score_baseline_all = []
+    y_score_full_all = []
+    auc_baseline_scores = []
+    auc_full_scores = []
+
+    for held_out in snapshots_present:
+        train_mask = feature_table["snapshot"] != held_out
+        test_mask = feature_table["snapshot"] == held_out
+
+        y_train = feature_table.loc[train_mask, "won"].values
+        y_test = feature_table.loc[test_mask, "won"].values
+
+        # Skip folds with no positive or no negative examples in test
+        if y_test.sum() == 0 or (y_test == 0).sum() == 0:
+            continue
+        if y_train.sum() == 0 or (y_train == 0).sum() == 0:
+            continue
+
+        # Standardize on train, transform test
+        scaler_b = StandardScaler()
+        scaler_f = StandardScaler()
+
+        X_train_b = scaler_b.fit_transform(feature_table.loc[train_mask, ["in_degree"]].values)
+        X_test_b = scaler_b.transform(feature_table.loc[test_mask, ["in_degree"]].values)
+        X_train_f = scaler_f.fit_transform(feature_table.loc[train_mask, feature_names].values)
+        X_test_f = scaler_f.transform(feature_table.loc[test_mask, feature_names].values)
+
+        # Model A: in-degree only
+        model_a = LogisticRegression(max_iter=1000, random_state=42)
+        model_a.fit(X_train_b, y_train)
+        proba_a = model_a.predict_proba(X_test_b)[:, 1]
+
+        # Model B: all centrality features
+        model_b = LogisticRegression(max_iter=1000, random_state=42)
+        model_b.fit(X_train_f, y_train)
+        proba_b = model_b.predict_proba(X_test_f)[:, 1]
+
+        fpr_a, tpr_a, _ = roc_curve(y_test, proba_a)
+        fpr_b, tpr_b, _ = roc_curve(y_test, proba_b)
+        auc_a = auc(fpr_a, tpr_a)
+        auc_b = auc(fpr_b, tpr_b)
+
+        if not (np.isnan(auc_a) or np.isnan(auc_b)):
+            auc_baseline_scores.append(auc_a)
+            auc_full_scores.append(auc_b)
+
+        y_true_all.extend(y_test)
+        y_score_baseline_all.extend(proba_a)
+        y_score_full_all.extend(proba_b)
+
+    if not auc_baseline_scores:
+        return {"error": "No valid CV folds (each snapshot needs both winners and non-winners)"}
+
+    # Final ROC curve from pooled out-of-fold predictions
+    fpr_base, tpr_base, _ = roc_curve(y_true_all, y_score_baseline_all)
+    fpr_full, tpr_full, _ = roc_curve(y_true_all, y_score_full_all)
+
+    # Fit final model on all data for coefficients
+    scaler_final = StandardScaler()
+    X_all = scaler_final.fit_transform(feature_table[feature_names].values)
+    y_all = feature_table["won"].values
+    final_model = LogisticRegression(max_iter=1000, random_state=42)
+    final_model.fit(X_all, y_all)
+    coefficients = dict(zip(feature_names, final_model.coef_[0].tolist()))
+
+    auc_baseline = float(np.mean(auc_baseline_scores))
+    auc_full = float(np.mean(auc_full_scores))
+
+    return {
+        "auc_baseline": round(auc_baseline, 4),
+        "auc_full": round(auc_full, 4),
+        "auc_improvement": round(auc_full - auc_baseline, 4),
+        "coefficients": {k: round(v, 4) for k, v in coefficients.items()},
+        "feature_table": feature_table,
+        "roc_data": {
+            "fpr_baseline": fpr_base.tolist(),
+            "tpr_baseline": tpr_base.tolist(),
+            "fpr_full": fpr_full.tolist(),
+            "tpr_full": tpr_full.tolist(),
+        },
+        "n_folds_used": len(auc_baseline_scores),
+        "n_snapshots": len(snapshots_present),
+    }
+
+
+# ---------------------------------------------------------------------------
+# RENDERING HELPER: ADVANCED ANALYSES
+# ---------------------------------------------------------------------------
+
+def _render_advanced_analyses(combined_df, precomputed, flags):
+    """
+    Render all advanced analysis sections.
+
+    flags: dict with keys like run_centrality, run_near_miss, run_temporal,
+           run_proximity, near_miss_min, show_centrality, show_near_miss,
+           show_temporal, show_proximity.
+    """
+    import matplotlib.pyplot as plt
+
+    # --- Temporal Evolution ---
+    if flags.get("show_temporal"):
+        st.subheader("Temporal Network Evolution")
+        st.markdown(
+            "**What this measures:** We build a cumulative nomination network for each "
+            "year from 1901 to 1970, adding that year's edges to all prior edges. At each "
+            "year we track four structural properties: **(a)** the fraction of the network "
+            "in the giant connected component (GCC), **(b)** mean degree (average number "
+            "of connections per person), **(c)** clustering coefficient (how often a "
+            "person's contacts are also connected to each other), and **(d)** total "
+            "network size.\n\n"
+            "**What to expect:** The GCC fraction should rise sharply in the early decades "
+            "as the network 'percolates' -- isolated clusters merge into one large "
+            "component. Look for a phase transition around 1920-1930 (the dashed line "
+            "marks 1925, a structural transition identified by Hansson & Schlich). Mean "
+            "degree should grow steadily as repeat nominations accumulate. Per-category "
+            "lines may diverge: Physics and Chemistry typically grow faster than "
+            "Literature or Peace.\n\n"
+            "**Interpretation:** A rapid rise in GCC fraction indicates the nomination "
+            "community became *structurally integrated* -- most nominators and nominees "
+            "are connected through some chain of shared nominations. This matters because "
+            "information (and reputation) can flow through connected networks. A high "
+            "clustering coefficient means nominations are locally clustered: the people "
+            "who nominate the same candidate also tend to nominate each other's candidates."
+        )
+        if flags.get("run_temporal"):
+            with st.spinner("Computing temporal evolution (building 70 cumulative graphs)..."):
+                result = compute_temporal_evolution(combined_df)
+
+            if "error" in result:
+                st.error(result["error"])
+            else:
+                overall = result["overall"]
+                by_category = result["by_category"]
+                categories = result["category_list"]
+
+                cat_colors = {
+                    "Physics": "#1f77b4",
+                    "Chemistry": "#2ca02c",
+                    "Physiology or Medicine": "#d62728",
+                    "Medicine": "#d62728",
+                    "Literature": "#9467bd",
+                    "Peace": "#ff7f0e",
+                }
+
+                fig, axes = plt.subplots(2, 2, figsize=(12, 9))
+
+                # (a) GCC fraction
+                ax = axes[0, 0]
+                ax.plot(overall.index, overall["gcc_frac"], color="black",
+                        linewidth=2, label="Overall")
+                for cat in categories:
+                    if cat in by_category:
+                        cat_df = by_category[cat]
+                        ax.plot(cat_df.index, cat_df["gcc_frac"],
+                                color=cat_colors.get(cat, "#999"),
+                                linewidth=1, alpha=0.7, label=cat)
+                ax.axvline(x=1925, color="gray", linestyle="--", alpha=0.5)
+                ax.set_ylabel("GCC fraction")
+                ax.set_title("(a) Giant Connected Component")
+                ax.legend(fontsize=7, loc="lower right")
+
+                # (b) Mean degree
+                ax = axes[0, 1]
+                ax.plot(overall.index, overall["mean_degree"], color="black",
+                        linewidth=2, label="Overall")
+                for cat in categories:
+                    if cat in by_category:
+                        cat_df = by_category[cat]
+                        ax.plot(cat_df.index, cat_df["mean_degree"],
+                                color=cat_colors.get(cat, "#999"),
+                                linewidth=1, alpha=0.7, label=cat)
+                ax.axvline(x=1925, color="gray", linestyle="--", alpha=0.5)
+                ax.set_ylabel("Mean degree")
+                ax.set_title("(b) Mean Degree")
+                ax.legend(fontsize=7, loc="upper left")
+
+                # (c) Clustering coefficient
+                ax = axes[1, 0]
+                ax.plot(overall.index, overall["clustering"], color="black",
+                        linewidth=2)
+                ax.axvline(x=1925, color="gray", linestyle="--", alpha=0.5)
+                ax.set_ylabel("Clustering coefficient")
+                ax.set_xlabel("Year")
+                ax.set_title("(c) Clustering Coefficient")
+
+                # (d) Number of nodes
+                ax = axes[1, 1]
+                ax.plot(overall.index, overall["nodes"], color="black",
+                        linewidth=2, label="Overall")
+                for cat in categories:
+                    if cat in by_category:
+                        cat_df = by_category[cat]
+                        ax.plot(cat_df.index, cat_df["nodes"],
+                                color=cat_colors.get(cat, "#999"),
+                                linewidth=1, alpha=0.7, label=cat)
+                ax.axvline(x=1925, color="gray", linestyle="--", alpha=0.5)
+                ax.set_ylabel("Number of nodes")
+                ax.set_xlabel("Year")
+                ax.set_title("(d) Network Size")
+                ax.legend(fontsize=7, loc="upper left")
+
+                fig.tight_layout()
+                st.pyplot(fig)
+                _fig_download_buttons(fig, "temporal_evolution", "temporal")
+                plt.close(fig)
+
+                st.caption(
+                    "Vertical dashed line marks 1925 (Hansson & Schlich transition point). "
+                    "Note: Physiology/Medicine data ends at 1953."
+                )
+
+                # Download CSV
+                _csv_download_button(overall.reset_index(), "temporal_evolution.csv",
+                                     key="temporal_csv")
+        else:
+            st.info("Click **Run Evolution Analysis** in the sidebar.")
+
+    # --- Three Degrees of Influence ---
+    if flags.get("show_proximity"):
+        st.subheader("Three Degrees of Influence")
+        st.markdown(
+            "**What this measures:** In the co-nomination network (where nominees are "
+            "linked when they share a nominator), we compute each non-laureate nominee's "
+            "shortest-path distance to the nearest *past* laureate -- someone who won "
+            "strictly before that nominee's last nomination year. We then group nominees "
+            "by distance (1 hop, 2 hops, 3 hops, 4+, or unreachable) and compute the "
+            "win rate in each bucket.\n\n"
+            "**What to expect:** If the 'three degrees of influence' hypothesis holds, "
+            "win rates should decrease with distance: nominees who are 1 hop from a past "
+            "laureate should win more often than those 2 or 3 hops away. Unreachable "
+            "nominees (in a different connected component) should have the lowest win rate. "
+            "The effect may be strongest within 1-2 hops and flatten beyond 3.\n\n"
+            "**Interpretation:** A declining win rate with distance suggests that being "
+            "embedded in the same nomination neighborhood as past laureates is predictive "
+            "of success. This could reflect genuine influence (laureates advocate for "
+            "nearby nominees), shared quality (similar-caliber scientists are co-nominated "
+            "by the same experts), or institutional clustering (elite departments produce "
+            "both laureates and future laureates). The analysis cannot distinguish these "
+            "mechanisms, but a strong distance gradient is evidence that network position "
+            "matters."
+        )
+        if flags.get("run_proximity"):
+            with st.spinner("Computing proximity to laureates (BFS from each nominee)..."):
+                result = compute_proximity_effect(combined_df, precomputed)
+
+            if "error" in result:
+                st.error(result["error"])
+            else:
+                by_dist = result["by_distance"]
+
+                col1, col2, col3 = st.columns(3)
+                dist1_rate = by_dist.loc[by_dist["distance"] == "1", "win_rate"]
+                dist3p_rate = by_dist.loc[by_dist["distance"].isin(["3", "4+"]), "win_rate"]
+                col1.metric("Win rate (distance 1)",
+                            f"{float(dist1_rate.iloc[0]) * 100:.1f}%" if len(dist1_rate) > 0 else "N/A")
+                col2.metric("Win rate (distance 3+)",
+                            f"{float(dist3p_rate.mean()) * 100:.1f}%" if len(dist3p_rate) > 0 else "N/A")
+                col3.metric("Win rate (unreachable)",
+                            f"{result['unreachable_rate'] * 100:.1f}%")
+
+                fig, ax = plt.subplots(figsize=(7, 4))
+                x_labels = by_dist["distance"].values
+                win_rates = by_dist["win_rate"].values * 100
+                colors = ["#2ca02c", "#98df8a", "#ffbb78", "#ff7f0e", "#d62728"]
+                bars = ax.bar(x_labels, win_rates, color=colors[:len(x_labels)],
+                              edgecolor="black")
+                ax.set_xlabel("Distance to nearest past laureate")
+                ax.set_ylabel("Win rate (%)")
+                ax.set_title("Proximity to Past Laureates and Win Rate")
+                max_rate = max(win_rates) if max(win_rates) > 0 else 10
+                ax.set_ylim(0, max_rate * 1.55)
+                for bar, rate, row_data in zip(bars, win_rates, by_dist.itertuples()):
+                    ax.text(bar.get_x() + bar.get_width() / 2,
+                            bar.get_height() + max_rate * 0.03,
+                            f"{rate:.1f}% (n={row_data.n_nominees})",
+                            ha="center", va="bottom", fontsize=8)
+                fig.tight_layout()
+                st.pyplot(fig)
+                _fig_download_buttons(fig, "proximity_effect", "proximity")
+                plt.close(fig)
+
+                st.caption(
+                    "Distance measured in the co-nomination network (nominees sharing "
+                    "nominators). 'Past laureate' = won strictly before the nominee's "
+                    "first nomination year."
+                )
+                _csv_download_button(by_dist, "proximity_distance.csv",
+                                     key="proximity_csv")
+
+                # Decade stratification
+                by_decade = result.get("by_decade", {})
+                if by_decade:
+                    st.markdown("#### Win Rate by Distance, Stratified by Decade")
+                    st.caption(
+                        "Controls for time-period bias: early nominees have few "
+                        "past laureates to be near, inflating distances."
+                    )
+                    decade_rows = []
+                    for dec in sorted(by_decade.keys()):
+                        dec_df = by_decade[dec]
+                        for _, r in dec_df.iterrows():
+                            decade_rows.append({
+                                "Decade": dec,
+                                "Distance": r["distance"],
+                                "N": r["n_nominees"],
+                                "Won": r["n_won"],
+                                "Win rate": f"{r['win_rate'] * 100:.1f}%",
+                            })
+                    st.dataframe(pd.DataFrame(decade_rows), hide_index=True)
+        else:
+            st.info("Click **Run Proximity Analysis** in the sidebar.")
+
+    # --- Near-Miss Analysis ---
+    if flags.get("show_near_miss"):
+        st.subheader("Near-Miss Analysis")
+        st.markdown(
+            "**What this measures:** We identify 'near-misses' -- nominees who received "
+            "many nominations but never won -- and compare their nomination neighborhoods "
+            "to winners with similar nomination counts. Four metrics capture different "
+            "aspects of support structure:\n"
+            "- **Support breadth**: number of unique nominators (wide vs. narrow support)\n"
+            "- **Nominator diversity**: number of distinct communities among a nominee's "
+            "nominators (are they championed by one clique or multiple independent groups?)\n"
+            "- **Nominator reach**: mean degree of a nominee's nominators (are they "
+            "nominated by well-connected, influential people or by peripheral ones?)\n"
+            "- **Concentration** (Herfindahl index): how evenly spread the nominations "
+            "are across nominators (1.0 = all from one person; low = distributed)\n\n"
+            "**What to expect:** If winning depends on more than raw nomination count, "
+            "winners should differ from near-misses on these structural metrics. "
+            "Specifically, winners may have *broader* support (more unique nominators), "
+            "*more diverse* nominator communities, and *higher-reach* nominators. "
+            "Near-misses may show higher concentration (intense support from a small "
+            "group that wasn't enough).\n\n"
+            "**Interpretation:** The box plots compare distributions and the Mann-Whitney "
+            "U test reports whether the difference is statistically significant "
+            "(p < 0.05). A significant difference in breadth or diversity suggests that "
+            "*who* supports you and *how many independent groups* back you matters more "
+            "than raw nomination volume alone. This aligns with the idea that the Nobel "
+            "committee is more persuaded by broad, independent consensus than by a "
+            "concentrated campaign from a single community."
+        )
+        if flags.get("run_near_miss"):
+            min_noms = flags.get("near_miss_min", 10)
+            with st.spinner(f"Analyzing near-misses (min {min_noms} nominations)..."):
+                result = compute_near_miss_analysis(combined_df, precomputed,
+                                                    min_nominations=min_noms)
+
+            col1, col2 = st.columns(2)
+            col1.metric("Near-misses", result["n_near_misses"])
+            col2.metric("Comparable winners", result["n_winners"])
+
+            # Box plots: 2x2 grid
+            metrics = ["breadth", "diversity", "reach", "concentration"]
+            titles = ["Support Breadth\n(unique nominators)",
+                      "Nominator Diversity\n(communities)",
+                      "Nominator Reach\n(mean nominator degree)",
+                      "Concentration\n(Herfindahl index)"]
+
+            fig, axes = plt.subplots(2, 2, figsize=(11, 8))
+            for i, (metric, title) in enumerate(zip(metrics, titles)):
+                ax = axes[i // 2, i % 2]
+                w_vals = result["winner_table"][metric].values if len(result["winner_table"]) > 0 else []
+                nm_vals = result["near_miss_table"][metric].values if len(result["near_miss_table"]) > 0 else []
+
+                data = []
+                labels = []
+                if len(w_vals) > 0:
+                    data.append(w_vals)
+                    labels.append("Winners")
+                if len(nm_vals) > 0:
+                    data.append(nm_vals)
+                    labels.append("Near-misses")
+
+                if data:
+                    bp = ax.boxplot(data, labels=labels, patch_artist=True)
+                    colors_box = ["#FFD700", "#999999"]
+                    for patch, color in zip(bp["boxes"], colors_box[:len(data)]):
+                        patch.set_facecolor(color)
+
+                comp = result["comparison"].get(metric, {})
+                p_val = comp.get("p_value", 1.0)
+                ax.set_title(f"{title}\n(p = {p_val:.2e})", fontsize=10)
+
+            fig.tight_layout()
+            st.pyplot(fig)
+            _fig_download_buttons(fig, "near_miss_comparison", "near_miss_plot")
+            plt.close(fig)
+
+            # Comparison table
+            st.markdown("#### Statistical Comparison (Mann-Whitney U)")
+            comp_rows = []
+            for metric in metrics:
+                comp = result["comparison"][metric]
+                comp_rows.append({
+                    "Metric": metric.replace("_", " ").title(),
+                    "Winner Mean": comp["winner_mean"],
+                    "Near-Miss Mean": comp["near_miss_mean"],
+                    "U statistic": comp["u_stat"],
+                    "p-value": f"{comp['p_value']:.2e}",
+                })
+            st.dataframe(pd.DataFrame(comp_rows), hide_index=True)
+
+            # Top near-misses
+            st.markdown("#### Top 20 Near-Misses by Nomination Count")
+            st.dataframe(result["top_near_misses"], hide_index=True)
+            _csv_download_button(result["near_miss_table"], "near_misses.csv",
+                                 key="near_miss_csv")
+            _csv_download_button(result["winner_table"], "comparable_winners.csv",
+                                 key="winners_csv")
+        else:
+            st.info("Click **Run Near-Miss Analysis** in the sidebar.")
+
+    # --- Centrality Predicts Winners ---
+    if flags.get("show_centrality"):
+        st.subheader("Centrality Predicts Winners")
+        st.markdown(
+            "**What this measures:** At 5-year snapshots (1910, 1915, ..., 1965), we "
+            "build the cumulative nomination network and compute four centrality measures "
+            "for each nominee:\n"
+            "- **In-degree** (weighted): raw nomination count -- the baseline\n"
+            "- **PageRank**: a nominee's importance weighted by the importance of their "
+            "nominators (being nominated by someone who is themselves highly nominated "
+            "counts more)\n"
+            "- **Betweenness centrality**: how often a nominee lies on the shortest path "
+            "between other people in the network (bridge positions)\n"
+            "- **Eigenvector centrality**: similar to PageRank but for undirected "
+            "influence -- being connected to other well-connected people\n\n"
+            "We then ask: does a nominee win within 10 years after the snapshot? Two "
+            "logistic regression models are compared using 5-fold cross-validated "
+            "AUC-ROC: **(A)** in-degree only (does raw nomination count predict winning?) "
+            "vs. **(B)** all four centrality features (does structural position add "
+            "predictive power?).\n\n"
+            "**What to expect:** The baseline AUC should be above 0.5 (nomination count "
+            "alone has some predictive value). If structural position matters, the full "
+            "model's AUC should be meaningfully higher. The coefficient table reveals "
+            "which centrality feature contributes most.\n\n"
+            "**Interpretation:** An AUC improvement from adding PageRank/betweenness/"
+            "eigenvector means that *who* nominates you carries information beyond *how "
+            "many* people nominate you. A large positive PageRank coefficient, for "
+            "example, would mean that being nominated by influential nominators predicts "
+            "winning. The ROC curve visualizes the tradeoff between true positives "
+            "(correctly predicted winners) and false positives (non-winners predicted to "
+            "win) -- a curve closer to the top-left corner indicates better prediction."
+        )
+        if flags.get("run_centrality"):
+            with st.spinner("Running centrality analysis (PageRank, betweenness, logistic regression)..."):
+                result = compute_centrality_prediction(combined_df, precomputed)
+
+            if "error" in result:
+                st.error(result["error"])
+            else:
+                col1, col2, col3 = st.columns(3)
+                col1.metric("AUC (in-degree only)", f"{result['auc_baseline']:.3f}")
+                col2.metric("AUC (all centrality)", f"{result['auc_full']:.3f}")
+                col3.metric("Improvement", f"+{result['auc_improvement']:.3f}")
+
+                # ROC curve
+                roc = result["roc_data"]
+                fig, ax = plt.subplots(figsize=(6, 5))
+                ax.plot(roc["fpr_baseline"], roc["tpr_baseline"],
+                        color="#999999", linewidth=2,
+                        label=f"In-degree only (AUC={result['auc_baseline']:.3f})")
+                ax.plot(roc["fpr_full"], roc["tpr_full"],
+                        color="#d62728", linewidth=2,
+                        label=f"All centrality (AUC={result['auc_full']:.3f})")
+                ax.plot([0, 1], [0, 1], color="black", linestyle="--", alpha=0.3)
+                ax.set_xlabel("False Positive Rate")
+                ax.set_ylabel("True Positive Rate")
+                ax.set_title("ROC Curve: Predicting Nobel Winners from Network Position")
+                ax.legend(loc="lower right")
+                fig.tight_layout()
+                st.pyplot(fig)
+                _fig_download_buttons(fig, "centrality_roc", "centrality_roc")
+                plt.close(fig)
+
+                # Coefficient table
+                st.markdown("#### Feature Coefficients (Logistic Regression)")
+                coef_df = pd.DataFrame([
+                    {"Feature": k, "Coefficient": v}
+                    for k, v in sorted(result["coefficients"].items(),
+                                       key=lambda x: abs(x[1]), reverse=True)
+                ])
+                st.dataframe(coef_df, hide_index=True)
+
+                st.caption(
+                    "Positive coefficients indicate features that increase the "
+                    "probability of winning. Coefficients are on standardized features."
+                )
+
+                _csv_download_button(result["feature_table"],
+                                     "centrality_features.csv",
+                                     key="centrality_csv")
+        else:
+            st.info("Click **Run Centrality Analysis** in the sidebar.")
