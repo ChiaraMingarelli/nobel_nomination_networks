@@ -658,6 +658,7 @@ def render_network_page(df: pd.DataFrame, precomputed: dict | None = None,
     analysis_options.append("Campaign Detection")
     if has_combined and has_precomputed:
         analysis_options.append("Campaign Success Rate")
+        analysis_options.append("Burst Decomposition")
     # -- Data --
     analysis_options.append("Raw Edge Data")
 
@@ -673,16 +674,19 @@ def render_network_page(df: pd.DataFrame, precomputed: dict | None = None,
     show_near_miss = analysis_selection == "Near-Miss Analysis"
     show_campaigns = analysis_selection == "Campaign Detection"
     show_campaign_success = analysis_selection == "Campaign Success Rate"
+    show_burst_decomp = analysis_selection == "Burst Decomposition"
     show_raw = analysis_selection == "Raw Edge Data"
 
     run_campaigns = run_lcc = False
     run_centrality = run_near_miss = run_temporal = run_proximity = False
-    run_campaign_success = False
+    run_campaign_success = run_burst_decomp = False
     min_noms = 5
     campaign_window = 3
     near_miss_min = 10
     cs_min_noms = 5
     cs_window = 3
+    bd_min_noms = 5
+    bd_window = 3
 
     if show_temporal:
         run_temporal = st.sidebar.button("Run Evolution Analysis", key="temporal_btn")
@@ -703,6 +707,10 @@ def render_network_page(df: pd.DataFrame, precomputed: dict | None = None,
         cs_min_noms = st.sidebar.slider("Min nominations (burst)", 3, 15, 5, key="cs_min_noms")
         cs_window = st.sidebar.slider("Year window", 1, 5, 3, key="cs_window")
         run_campaign_success = st.sidebar.button("Run Campaign Success Analysis", key="cs_btn")
+    elif show_burst_decomp:
+        bd_min_noms = st.sidebar.slider("Min nominations", 3, 15, 5, key="bd_min_noms")
+        bd_window = st.sidebar.slider("Year window", 1, 5, 3, key="bd_window")
+        run_burst_decomp = st.sidebar.button("Run Burst Decomposition", key="bd_btn")
 
     # --- Main area ---
     st.header("Nomination Networks")
@@ -746,6 +754,10 @@ def render_network_page(df: pd.DataFrame, precomputed: dict | None = None,
         "run_campaign_success": run_campaign_success,
         "cs_min_noms": cs_min_noms,
         "cs_window": cs_window,
+        "show_burst_decomp": show_burst_decomp,
+        "run_burst_decomp": run_burst_decomp,
+        "bd_min_noms": bd_min_noms,
+        "bd_window": bd_window,
     }
     _render_advanced_analyses(combined_df, cat_combined, precomputed, adv_flags)
 
@@ -1863,21 +1875,288 @@ def compute_campaign_success(combined_df: pd.DataFrame, precomputed: dict,
 
 
 # ---------------------------------------------------------------------------
-# ANALYSIS 8: CENTRALITY PREDICTS WINNERS
+# ANALYSIS 8: BURST DECOMPOSITION (INSIDERS VS OUTSIDERS)
+# ---------------------------------------------------------------------------
+
+def compute_burst_decomposition(combined_df: pd.DataFrame, precomputed: dict,
+                                min_nominations: int = 5,
+                                year_window: int = 3) -> dict:
+    """
+    Decompose nomination bursts into insider (connected) vs outsider (independent)
+    campaigns by analyzing co-activity among burst nominators.
+
+    For each burst, builds a co-activity subgraph among the burst's nominators
+    (EXCLUDING the target nominee from shared-nominee links). Two burst nominators
+    are linked if they share at least one OTHER nominee in common. The connected
+    fraction measures what proportion of burst nominators are part of this
+    co-activity network.
+
+    Classification:
+      - independent (connected_frac = 0): no burst nominators share other nominees
+      - connected (connected_frac > 0): at least some nominators are co-active
+
+    Returns dict with burst_table, counts, win rates, Fisher/CMH tests, and
+    per-band breakdown.
+    """
+    from scipy.stats import fisher_exact
+
+    # --- Step 1: Detect bursts with relative-burst filter (same as campaign success) ---
+    raw_campaigns_df = detect_campaigns(combined_df, min_nominations=min_nominations,
+                                        year_window=year_window)
+    if raw_campaigns_df.empty:
+        return {"error": "No bursts detected with current thresholds."}
+
+    # Relative-burst filter
+    nominee_year_counts = combined_df.groupby(
+        ["nominee_name", "year"]).size().reset_index(name="count")
+
+    filtered_campaigns = []
+    for _, row in raw_campaigns_df.iterrows():
+        nominee = row["nominee"]
+        nom_years = nominee_year_counts[nominee_year_counts["nominee_name"] == nominee]
+        if nom_years.empty:
+            continue
+        window_years = row["year_end"] - row["year_start"] + 1
+        window_annual_rate = row["n_nominations"] / window_years
+        burst_year_set = set(range(int(row["year_start"]), int(row["year_end"]) + 1))
+        baseline = nom_years[~nom_years["year"].isin(burst_year_set)]["count"]
+        if len(baseline) <= 1:
+            filtered_campaigns.append(row)
+        else:
+            base_mean = float(baseline.mean())
+            base_std = float(baseline.std())
+            threshold = max(base_mean + 2 * base_std, base_mean * 1.5)
+            if window_annual_rate > threshold:
+                filtered_campaigns.append(row)
+
+    if not filtered_campaigns:
+        return {"error": "No anomalous bursts detected (all bursts are "
+                "consistent with nominees' baseline nomination rates)."}
+
+    campaigns_df = pd.DataFrame(filtered_campaigns)
+
+    # --- Step 2: Build nominator_to_nominees lookup ---
+    nominator_to_nominees = defaultdict(set)
+    for row in combined_df.itertuples(index=False):
+        nominator_to_nominees[row.nominator_name].add(row.nominee_name)
+
+    # --- Step 3: Per-nominee stats ---
+    has_prize_col = "nominee_prize_year" in combined_df.columns
+    nominee_stats = {}
+    for row in combined_df.itertuples(index=False):
+        nominee = row.nominee_name
+        if nominee not in nominee_stats:
+            won = has_prize_col and pd.notna(row.nominee_prize_year)
+            nominee_stats[nominee] = {"won": bool(won), "total_noms": 0}
+        nominee_stats[nominee]["total_noms"] += 1
+
+    # --- Step 4: For each burst, compute co-activity subgraph among burst nominators ---
+    burst_rows = []
+    # Process best burst per nominee (highest nomination count)
+    best_bursts = campaigns_df.sort_values("n_nominations", ascending=False).drop_duplicates(
+        subset="nominee", keep="first")
+
+    for _, burst in best_bursts.iterrows():
+        nominee = burst["nominee"]
+        if nominee not in nominee_stats:
+            continue
+
+        # Get nominators active during the burst window
+        burst_year_set = set(range(int(burst["year_start"]), int(burst["year_end"]) + 1))
+        burst_noms_df = combined_df[
+            (combined_df["nominee_name"] == nominee) &
+            (combined_df["year"].isin(burst_year_set))
+        ]
+        burst_nominators = list(burst_noms_df["nominator_name"].unique())
+        n_burst_nominators = len(burst_nominators)
+
+        if n_burst_nominators < 2:
+            # Single nominator — trivially independent
+            burst_rows.append({
+                "nominee": nominee,
+                "won": nominee_stats[nominee]["won"],
+                "total_noms": nominee_stats[nominee]["total_noms"],
+                "burst_noms": int(burst["n_nominations"]),
+                "n_burst_nominators": n_burst_nominators,
+                "connected_frac": 0.0,
+                "n_countries": 1,
+                "burst_type": "independent",
+            })
+            continue
+
+        # Build co-activity subgraph among burst nominators, EXCLUDING the target
+        co_activity = nx.Graph()
+        co_activity.add_nodes_from(burst_nominators)
+        for i in range(len(burst_nominators)):
+            for j in range(i + 1, len(burst_nominators)):
+                n1, n2 = burst_nominators[i], burst_nominators[j]
+                # Shared nominees EXCLUDING the target
+                shared = (nominator_to_nominees.get(n1, set()) &
+                          nominator_to_nominees.get(n2, set())) - {nominee}
+                if shared:
+                    co_activity.add_edge(n1, n2, weight=len(shared))
+
+        # Connected fraction: fraction of burst nominators with degree > 0
+        connected_count = sum(1 for n in burst_nominators if co_activity.degree(n) > 0)
+        connected_frac = connected_count / n_burst_nominators
+
+        # Country diversity among burst nominators
+        if "nominator_country" in burst_noms_df.columns:
+            countries = burst_noms_df["nominator_country"].dropna().unique()
+            n_countries = len([c for c in countries if c != "Unknown"])
+        else:
+            n_countries = 0
+
+        # Classify
+        if connected_frac == 0:
+            burst_type = "independent"
+        elif connected_frac < 0.5:
+            burst_type = "mixed"
+        else:
+            burst_type = "coordinated"
+
+        burst_rows.append({
+            "nominee": nominee,
+            "won": nominee_stats[nominee]["won"],
+            "total_noms": nominee_stats[nominee]["total_noms"],
+            "burst_noms": int(burst["n_nominations"]),
+            "n_burst_nominators": n_burst_nominators,
+            "connected_frac": round(connected_frac, 3),
+            "n_countries": n_countries,
+            "burst_type": burst_type,
+        })
+
+    if not burst_rows:
+        return {"error": "Could not compute burst decomposition."}
+
+    burst_table = pd.DataFrame(burst_rows)
+
+    # --- Step 5: Binary split: independent (cf=0) vs connected (cf>0) ---
+    independent = burst_table[burst_table["connected_frac"] == 0]
+    connected = burst_table[burst_table["connected_frac"] > 0]
+
+    n_independent = len(independent)
+    n_connected = len(connected)
+    independent_win_rate = float(independent["won"].mean()) if n_independent > 0 else 0
+    connected_win_rate = float(connected["won"].mean()) if n_connected > 0 else 0
+
+    # Fisher exact test (overall)
+    if n_independent > 0 and n_connected > 0:
+        i_won = int(independent["won"].sum())
+        c_won = int(connected["won"].sum())
+        contingency = [[c_won, n_connected - c_won],
+                       [i_won, n_independent - i_won]]
+        fisher_or, fisher_p = fisher_exact(contingency, alternative="two-sided")
+    else:
+        fisher_or, fisher_p = float("nan"), float("nan")
+
+    # --- Step 6: Stratified comparison by nomination-count band ---
+    first_lo = min(min_nominations, 5)
+    bins = [(first_lo, 10), (11, 20), (21, 50), (51, 500)]
+    bin_labels = [f"{first_lo}-10", "11-20", "21-50", "51+"]
+    if first_lo > 10:
+        bins = [(first_lo, 20), (21, 50), (51, 500)]
+        bin_labels = [f"{first_lo}-20", "21-50", "51+"]
+
+    bin_breakdown = []
+    cmh_tables = []
+    for (lo, hi), label in zip(bins, bin_labels):
+        ind_in_bin = independent[(independent["total_noms"] >= lo) &
+                                 (independent["total_noms"] <= hi)]
+        con_in_bin = connected[(connected["total_noms"] >= lo) &
+                                (connected["total_noms"] <= hi)]
+        n_ind = len(ind_in_bin)
+        n_con = len(con_in_bin)
+        ind_won = int(ind_in_bin["won"].sum()) if n_ind > 0 else 0
+        con_won = int(con_in_bin["won"].sum()) if n_con > 0 else 0
+
+        bin_breakdown.append({
+            "nom_range": label,
+            "outsider_n": n_ind,
+            "outsider_won": ind_won,
+            "outsider_rate": float(ind_in_bin["won"].mean()) if n_ind > 0 else 0,
+            "insider_n": n_con,
+            "insider_won": con_won,
+            "insider_rate": float(con_in_bin["won"].mean()) if n_con > 0 else 0,
+        })
+
+        if n_ind > 0 and n_con > 0:
+            cmh_tables.append(np.array([
+                [con_won, n_con - con_won],
+                [ind_won, n_ind - ind_won],
+            ]))
+
+    # CMH test
+    cmh_stat, cmh_p = float("nan"), float("nan")
+    if len(cmh_tables) >= 2:
+        numerator = 0.0
+        denominator = 0.0
+        for tbl in cmh_tables:
+            n_k = tbl.sum()
+            if n_k <= 1:
+                continue
+            a = tbl[0, 0]
+            r1 = tbl[0].sum()
+            c1 = tbl[:, 0].sum()
+            expected_a = r1 * c1 / n_k
+            r2 = tbl[1].sum()
+            c2 = tbl[:, 1].sum()
+            var_a = r1 * r2 * c1 * c2 / (n_k ** 2 * (n_k - 1))
+            numerator += a - expected_a
+            denominator += var_a
+        if denominator > 0:
+            from scipy.stats import norm
+            corrected = max(0, abs(numerator) - 0.5)
+            cmh_stat = corrected ** 2 / denominator
+            cmh_p = 1.0 - norm.cdf(corrected / denominator ** 0.5)
+            cmh_p = 2 * cmh_p
+
+    # Point-biserial correlation: diversity (n_countries) vs winning
+    from scipy.stats import pointbiserialr
+    try:
+        r_pb, p_pb = pointbiserialr(
+            burst_table["won"].astype(int).values,
+            burst_table["n_countries"].values)
+    except Exception:
+        r_pb, p_pb = float("nan"), float("nan")
+
+    return {
+        "burst_table": burst_table.sort_values("burst_noms", ascending=False),
+        "n_independent": n_independent,
+        "n_connected": n_connected,
+        "independent_win_rate": independent_win_rate,
+        "connected_win_rate": connected_win_rate,
+        "fisher_or": float(fisher_or) if not np.isnan(fisher_or) else float("nan"),
+        "fisher_p": float(fisher_p) if not np.isnan(fisher_p) else float("nan"),
+        "cmh_stat": cmh_stat,
+        "cmh_p": cmh_p,
+        "bin_breakdown": pd.DataFrame(bin_breakdown),
+        "point_biserial_diversity": (round(float(r_pb), 4), round(float(p_pb), 4)),
+    }
+
+
+# ---------------------------------------------------------------------------
+# ANALYSIS 9: CENTRALITY PREDICTS WINNERS
 # ---------------------------------------------------------------------------
 
 def compute_centrality_prediction(combined_df: pd.DataFrame, precomputed: dict) -> dict:
     """
     Does network position at time t predict winning at t+k?
 
-    Builds cumulative directed nomination graphs at 5-year snapshots, computes
-    centrality metrics for each nominee, and runs logistic regression to compare
-    AUC-ROC of in-degree-only vs full-centrality models.
+    Builds cumulative directed nomination graphs at 5-year snapshots. For each
+    nominee, computes structural features matching the paper's model:
+      - in_degree: weighted in-degree (number of nominations)
+      - breadth: number of unique nominators
+      - diversity: Louvain communities among nominator co-activity subgraph
+      - reach: mean degree of nominators
+      - concentration: Herfindahl index of nominator contributions
 
-    CV uses leave-one-snapshot-out to respect temporal structure and avoid
-    leaking information across correlated observations of the same nominee.
+    Compares three logistic regression models via leave-one-snapshot-out CV:
+      1. in_degree_only: just weighted in-degree (baseline)
+      2. structural: breadth, diversity, reach, concentration
+      3. full: in_degree + all structural features
 
-    Returns dict with AUC scores, coefficients, feature table, and ROC data.
+    Returns dict with per-model AUC, coefficients, feature table, and ROC data.
     """
     from sklearn.linear_model import LogisticRegression
     from sklearn.preprocessing import StandardScaler
@@ -1892,12 +2171,16 @@ def compute_centrality_prediction(combined_df: pd.DataFrame, precomputed: dict) 
     snapshot_years = list(range(1910, 1970, 5))
     all_observations = []
 
-    # Build cumulative graph incrementally — track the frontier year to avoid
-    # re-processing edges that were already added at earlier snapshots.
+    # Build cumulative graph incrementally
     G = nx.DiGraph()
     edges_by_year = df.groupby("year")
     all_years = sorted(df["year"].unique())
-    frontier = 0  # index into all_years: everything before this is already in G
+    frontier = 0
+
+    # Also track cumulative nominator->nominees mapping for structural features
+    cumulative_nominator_to_nominees = defaultdict(set)
+    cumulative_nominee_to_nominators = defaultdict(lambda: defaultdict(int))
+    cum_frontier = 0
 
     for snap_year in snapshot_years:
         # Add edges from frontier up to snap_year
@@ -1911,12 +2194,13 @@ def compute_centrality_prediction(combined_df: pd.DataFrame, precomputed: dict) 
                         G[n1][n2]["weight"] += 1
                     else:
                         G.add_edge(n1, n2, weight=1)
+                    cumulative_nominator_to_nominees[n1].add(n2)
+                    cumulative_nominee_to_nominators[n2][n1] += 1
             frontier += 1
 
         if G.number_of_nodes() < 10:
             continue
 
-        # Compute centrality measures for nominees (nodes with in-degree > 0)
         nominees_in_graph = [n for n in G.nodes if G.in_degree(n) > 0]
         if len(nominees_in_graph) < 10:
             continue
@@ -1924,22 +2208,24 @@ def compute_centrality_prediction(combined_df: pd.DataFrame, precomputed: dict) 
         # Weighted in-degree
         in_degrees = dict(G.in_degree(weight="weight"))
 
-        # PageRank (weighted)
-        try:
-            pagerank = nx.pagerank(G, weight="weight", max_iter=100)
-        except nx.PowerIterationFailedConvergence:
-            pagerank = {n: 1.0 / G.number_of_nodes() for n in G.nodes}
+        # Build nominator co-activity graph for this snapshot
+        # Two nominators linked if they share at least one nominee
+        nominator_coact = nx.Graph()
+        nominee_to_nors = defaultdict(set)
+        for nominator, nominees in cumulative_nominator_to_nominees.items():
+            for nom in nominees:
+                nominee_to_nors[nom].add(nominator)
 
-        # Betweenness centrality (approximate)
-        k_sample = min(200, G.number_of_nodes())
-        betweenness = nx.betweenness_centrality(G, k=k_sample, weight="weight", seed=42)
-
-        # Eigenvector centrality (on undirected version for convergence)
-        G_undirected = G.to_undirected()
-        try:
-            eigenvector = nx.eigenvector_centrality(G_undirected, weight="weight", max_iter=200)
-        except nx.PowerIterationFailedConvergence:
-            eigenvector = {n: 0.0 for n in G.nodes}
+        coact_edges = defaultdict(int)
+        for nom, nominators in nominee_to_nors.items():
+            nominators_list = sorted(nominators)
+            if len(nominators_list) > 50:
+                continue  # skip institutional
+            for i in range(len(nominators_list)):
+                for j in range(i + 1, len(nominators_list)):
+                    coact_edges[(nominators_list[i], nominators_list[j])] += 1
+        for (n1, n2), w in coact_edges.items():
+            nominator_coact.add_edge(n1, n2, weight=w)
 
         for nominee in nominees_in_graph:
             # Label: won within 10 years after snapshot?
@@ -1948,13 +2234,51 @@ def compute_centrality_prediction(combined_df: pd.DataFrame, precomputed: dict) 
             if laureate and snap_year < laureate["year_won"] <= snap_year + 10:
                 won = 1
 
+            # Structural features
+            nom_counts = cumulative_nominee_to_nominators[nominee]
+            total_noms = sum(nom_counts.values())
+            breadth = len(nom_counts)
+
+            # Reach: mean degree of nominators in the full graph
+            nominator_degrees = []
+            for nominator in nom_counts:
+                if nominator in G:
+                    nominator_degrees.append(G.degree(nominator, weight="weight"))
+            reach = float(np.mean(nominator_degrees)) if nominator_degrees else 0.0
+
+            # Concentration: Herfindahl index
+            if total_noms > 0:
+                shares = [c / total_noms for c in nom_counts.values()]
+                concentration = sum(s ** 2 for s in shares)
+            else:
+                concentration = 1.0
+
+            # Diversity: Louvain communities among this nominee's nominators
+            # in the co-activity graph (excluding the nominee from links)
+            nominator_set = set(nom_counts.keys())
+            nominator_subgraph_nodes = [n for n in nominator_set if n in nominator_coact]
+            if len(nominator_subgraph_nodes) > 2:
+                sub = nominator_coact.subgraph(nominator_subgraph_nodes)
+                if sub.number_of_edges() > 0:
+                    try:
+                        from networkx.algorithms.community import louvain_communities
+                        communities = louvain_communities(sub, seed=42)
+                        diversity = len(communities)
+                    except Exception:
+                        diversity = len(nominator_subgraph_nodes)
+                else:
+                    diversity = len(nominator_subgraph_nodes)
+            else:
+                diversity = max(len(nominator_subgraph_nodes), len(nominator_set))
+
             all_observations.append({
                 "snapshot": snap_year,
                 "nominee": nominee,
                 "in_degree": in_degrees.get(nominee, 0),
-                "pagerank": pagerank.get(nominee, 0),
-                "betweenness": betweenness.get(nominee, 0),
-                "eigenvector": eigenvector.get(nominee, 0),
+                "breadth": breadth,
+                "diversity": diversity,
+                "reach": round(reach, 2),
+                "concentration": round(concentration, 4),
                 "won": won,
             })
 
@@ -1962,22 +2286,28 @@ def compute_centrality_prediction(combined_df: pd.DataFrame, precomputed: dict) 
         return {"error": "Not enough data for centrality prediction"}
 
     feature_table = pd.DataFrame(all_observations)
-    feature_names = ["in_degree", "pagerank", "betweenness", "eigenvector"]
+
+    # Three model feature sets
+    in_degree_features = ["in_degree"]
+    structural_features = ["breadth", "diversity", "reach", "concentration"]
+    full_features = ["in_degree", "breadth", "diversity", "reach", "concentration"]
 
     # --- Leave-one-snapshot-out CV ---
-    # Each fold holds out one snapshot for testing and trains on the rest.
-    # This respects temporal structure and avoids the same nominee appearing
-    # in both train and test at the same snapshot.
     snapshots_present = sorted(feature_table["snapshot"].unique())
 
     if len(snapshots_present) < 3:
         return {"error": f"Only {len(snapshots_present)} snapshots with data — need at least 3 for CV"}
 
+    model_configs = {
+        "in_degree_only": in_degree_features,
+        "structural": structural_features,
+        "full": full_features,
+    }
+
+    # Collect per-model results
     y_true_all = []
-    y_score_baseline_all = []
-    y_score_full_all = []
-    auc_baseline_scores = []
-    auc_full_scores = []
+    y_scores = {name: [] for name in model_configs}
+    auc_scores = {name: [] for name in model_configs}
 
     for held_out in snapshots_present:
         train_mask = feature_table["snapshot"] != held_out
@@ -1986,75 +2316,76 @@ def compute_centrality_prediction(combined_df: pd.DataFrame, precomputed: dict) 
         y_train = feature_table.loc[train_mask, "won"].values
         y_test = feature_table.loc[test_mask, "won"].values
 
-        # Skip folds with no positive or no negative examples in test
         if y_test.sum() == 0 or (y_test == 0).sum() == 0:
             continue
         if y_train.sum() == 0 or (y_train == 0).sum() == 0:
             continue
 
-        # Standardize on train, transform test
-        scaler_b = StandardScaler()
-        scaler_f = StandardScaler()
+        fold_valid = True
+        for name, feats in model_configs.items():
+            scaler = StandardScaler()
+            X_train = scaler.fit_transform(feature_table.loc[train_mask, feats].values)
+            X_test = scaler.transform(feature_table.loc[test_mask, feats].values)
 
-        X_train_b = scaler_b.fit_transform(feature_table.loc[train_mask, ["in_degree"]].values)
-        X_test_b = scaler_b.transform(feature_table.loc[test_mask, ["in_degree"]].values)
-        X_train_f = scaler_f.fit_transform(feature_table.loc[train_mask, feature_names].values)
-        X_test_f = scaler_f.transform(feature_table.loc[test_mask, feature_names].values)
+            model = LogisticRegression(max_iter=1000, random_state=42)
+            model.fit(X_train, y_train)
+            proba = model.predict_proba(X_test)[:, 1]
 
-        # Model A: in-degree only
-        model_a = LogisticRegression(max_iter=1000, random_state=42)
-        model_a.fit(X_train_b, y_train)
-        proba_a = model_a.predict_proba(X_test_b)[:, 1]
+            fpr_fold, tpr_fold, _ = roc_curve(y_test, proba)
+            auc_fold = auc(fpr_fold, tpr_fold)
 
-        # Model B: all centrality features
-        model_b = LogisticRegression(max_iter=1000, random_state=42)
-        model_b.fit(X_train_f, y_train)
-        proba_b = model_b.predict_proba(X_test_f)[:, 1]
+            if np.isnan(auc_fold):
+                fold_valid = False
+                break
 
-        fpr_a, tpr_a, _ = roc_curve(y_test, proba_a)
-        fpr_b, tpr_b, _ = roc_curve(y_test, proba_b)
-        auc_a = auc(fpr_a, tpr_a)
-        auc_b = auc(fpr_b, tpr_b)
+            y_scores[name].extend(proba)
+            auc_scores[name].append(auc_fold)
 
-        if not (np.isnan(auc_a) or np.isnan(auc_b)):
-            auc_baseline_scores.append(auc_a)
-            auc_full_scores.append(auc_b)
+        if fold_valid:
+            y_true_all.extend(y_test)
 
-        y_true_all.extend(y_test)
-        y_score_baseline_all.extend(proba_a)
-        y_score_full_all.extend(proba_b)
-
-    if not auc_baseline_scores:
+    if not auc_scores["in_degree_only"]:
         return {"error": "No valid CV folds (each snapshot needs both winners and non-winners)"}
 
-    # Final ROC curve from pooled out-of-fold predictions
-    fpr_base, tpr_base, _ = roc_curve(y_true_all, y_score_baseline_all)
-    fpr_full, tpr_full, _ = roc_curve(y_true_all, y_score_full_all)
+    # Pooled ROC curves
+    roc_data = {}
+    model_results = {}
+    for name, feats in model_configs.items():
+        fpr_pooled, tpr_pooled, _ = roc_curve(y_true_all, y_scores[name])
+        mean_auc = float(np.mean(auc_scores[name]))
+        roc_data[name] = {
+            "fpr": fpr_pooled.tolist(),
+            "tpr": tpr_pooled.tolist(),
+        }
 
-    # Fit final model on all data for coefficients
-    scaler_final = StandardScaler()
-    X_all = scaler_final.fit_transform(feature_table[feature_names].values)
-    y_all = feature_table["won"].values
-    final_model = LogisticRegression(max_iter=1000, random_state=42)
-    final_model.fit(X_all, y_all)
-    coefficients = dict(zip(feature_names, final_model.coef_[0].tolist()))
+        # Final model on all data for coefficients
+        scaler_final = StandardScaler()
+        X_all = scaler_final.fit_transform(feature_table[feats].values)
+        y_all = feature_table["won"].values
+        final_model = LogisticRegression(max_iter=1000, random_state=42)
+        final_model.fit(X_all, y_all)
+        coefficients = dict(zip(feats, final_model.coef_[0].tolist()))
 
-    auc_baseline = float(np.mean(auc_baseline_scores))
-    auc_full = float(np.mean(auc_full_scores))
+        model_results[name] = {
+            "auc": round(mean_auc, 4),
+            "coefficients": {k: round(v, 4) for k, v in coefficients.items()},
+        }
+
+    # Backward-compatible keys
+    auc_baseline = model_results["in_degree_only"]["auc"]
+    auc_structural = model_results["structural"]["auc"]
+    auc_full = model_results["full"]["auc"]
 
     return {
-        "auc_baseline": round(auc_baseline, 4),
-        "auc_full": round(auc_full, 4),
+        "auc_baseline": auc_baseline,
+        "auc_structural": auc_structural,
+        "auc_full": auc_full,
         "auc_improvement": round(auc_full - auc_baseline, 4),
-        "coefficients": {k: round(v, 4) for k, v in coefficients.items()},
+        "model_results": model_results,
+        "coefficients": model_results["full"]["coefficients"],
         "feature_table": feature_table,
-        "roc_data": {
-            "fpr_baseline": fpr_base.tolist(),
-            "tpr_baseline": tpr_base.tolist(),
-            "fpr_full": fpr_full.tolist(),
-            "tpr_full": tpr_full.tolist(),
-        },
-        "n_folds_used": len(auc_baseline_scores),
+        "roc_data": roc_data,
+        "n_folds_used": len(auc_scores["in_degree_only"]),
         "n_snapshots": len(snapshots_present),
     }
 
@@ -2545,44 +2876,193 @@ def _render_advanced_analyses(combined_df, cat_combined, precomputed, flags):
         else:
             st.info("Click **Run Campaign Success Analysis** in the sidebar.")
 
+    # --- Burst Decomposition ---
+    if flags.get("show_burst_decomp"):
+        st.subheader("Burst Decomposition: Insiders vs Outsiders")
+        with st.expander("About this analysis"):
+            st.markdown(
+                "**What this measures:** For each nomination burst, builds a co-activity "
+                "subgraph among the burst's nominators. Two nominators are linked if they "
+                "share at least one OTHER nominee in common (excluding the target). The "
+                "**connected fraction** measures how many burst nominators are part of this "
+                "co-activity network.\n\n"
+                "**Classification:**\n"
+                "- **Outsider** (independent): connected fraction = 0 — none of the burst "
+                "nominators share other nominees in common\n"
+                "- **Insider** (connected): connected fraction > 0 — at least some burst "
+                "nominators are co-active on other candidates\n\n"
+                "**Interpretation:** Insider bursts come from nominators already embedded in "
+                "the same advocacy community. Outsider bursts represent independent, "
+                "uncoordinated recognition. The paper finds that outsider support is a "
+                "stronger predictor of winning."
+            )
+        if flags.get("run_burst_decomp"):
+            bd_min = flags.get("bd_min_noms", 5)
+            bd_win = flags.get("bd_window", 3)
+            with st.spinner("Computing burst decomposition (building co-activity subgraphs)..."):
+                result = compute_burst_decomposition(cat_combined, precomputed,
+                                                      min_nominations=bd_min,
+                                                      year_window=bd_win)
+
+            if "error" in result:
+                st.error(result["error"])
+            else:
+                # Key metrics row
+                col1, col2, col3, col4, col5 = st.columns(5)
+                col1.metric("Outsiders (independent)", result["n_independent"])
+                col2.metric("Insiders (connected)", result["n_connected"])
+                col3.metric("Outsider win rate",
+                            f"{result['independent_win_rate'] * 100:.1f}%")
+                col4.metric("Insider win rate",
+                            f"{result['connected_win_rate'] * 100:.1f}%")
+                cmh_p = result.get("cmh_p", float("nan"))
+                col5.metric("CMH p-value",
+                            f"{cmh_p:.3f}" if not np.isnan(cmh_p) else "N/A",
+                            help="Cochran-Mantel-Haenszel test stratified by "
+                                 "nomination-count band")
+
+                # Grouped bar chart: insider vs outsider win rates by band
+                bin_df = result["bin_breakdown"]
+                if not bin_df.empty:
+                    st.markdown("#### Win Rate by Nomination Count Band")
+
+                    fig, ax = plt.subplots(figsize=(8, 4.5))
+                    x_pos = np.arange(len(bin_df))
+                    bar_w = 0.35
+                    bars1 = ax.bar(x_pos - bar_w / 2,
+                                   bin_df["insider_rate"].values * 100,
+                                   bar_w, color="#d62728", edgecolor="black",
+                                   label="Insider (connected)")
+                    bars2 = ax.bar(x_pos + bar_w / 2,
+                                   bin_df["outsider_rate"].values * 100,
+                                   bar_w, color="#2ca02c", edgecolor="black",
+                                   label="Outsider (independent)")
+                    tick_labels = [
+                        f"{r['nom_range']}\n(I:{int(r['insider_n'])}, O:{int(r['outsider_n'])})"
+                        for _, r in bin_df.iterrows()
+                    ]
+                    ax.set_xticks(x_pos)
+                    ax.set_xticklabels(tick_labels, fontsize=8)
+                    ax.set_xlabel("Total lifetime nominations (I=insider, O=outsider)")
+                    ax.set_ylabel("Win rate (%)")
+                    ax.set_title("Insider vs. Outsider Win Rate by Nomination Count")
+                    ax.legend()
+                    fig.tight_layout()
+                    st.pyplot(fig)
+                    _fig_download_buttons(fig, "burst_decomposition", "burst_decomp")
+                    plt.close(fig)
+
+                    # Stratified table
+                    display_rows = []
+                    for _, r in bin_df.iterrows():
+                        display_rows.append({
+                            "Nominations": r["nom_range"],
+                            "Insider N": int(r["insider_n"]),
+                            "Insider won": int(r["insider_won"]),
+                            "Insider rate": f"{r['insider_rate'] * 100:.1f}%",
+                            "Outsider N": int(r["outsider_n"]),
+                            "Outsider won": int(r["outsider_won"]),
+                            "Outsider rate": f"{r['outsider_rate'] * 100:.1f}%",
+                        })
+                    st.dataframe(pd.DataFrame(display_rows), hide_index=True)
+
+                # Fisher and CMH stats
+                fisher_p = result.get("fisher_p", float("nan"))
+                fisher_or = result.get("fisher_or", float("nan"))
+                pb_r, pb_p = result.get("point_biserial_diversity", (float("nan"), float("nan")))
+                stats_parts = []
+                if not np.isnan(fisher_or):
+                    stats_parts.append(
+                        f"Fisher (overall) p = {fisher_p:.3f}, OR = {fisher_or:.2f}")
+                if not np.isnan(cmh_p):
+                    stats_parts.append(f"CMH (stratified) p = {cmh_p:.3f}")
+                if not np.isnan(pb_r):
+                    stats_parts.append(
+                        f"Country diversity vs winning: r = {pb_r:.3f}, p = {pb_p:.3f}")
+                if stats_parts:
+                    st.caption(". ".join(stats_parts) + ".")
+
+                # Top burst nominees table
+                st.markdown("#### Top Burst Nominees")
+                bt = result["burst_table"]
+                display_cols = ["nominee", "won", "total_noms", "burst_noms",
+                                "n_burst_nominators", "connected_frac",
+                                "n_countries", "burst_type"]
+                st.dataframe(bt[display_cols].head(30), hide_index=True)
+                _csv_download_button(bt, "burst_decomposition.csv",
+                                     key="burst_decomp_csv")
+        else:
+            st.info("Click **Run Burst Decomposition** in the sidebar.")
+
     # --- Centrality Predicts Winners ---
     if flags.get("show_centrality"):
         st.subheader("Centrality Predicts Winners")
         with st.expander("About this analysis"):
             st.markdown(
-                "**What this measures:** At 5-year snapshots, computes four centrality "
-                "measures (in-degree, PageRank, betweenness, eigenvector) for each nominee "
-                "and predicts whether they win within 10 years. Compares AUC-ROC of "
-                "in-degree-only vs. full-centrality logistic regression using "
-                "leave-one-snapshot-out CV.\n\n"
-                "**What to expect:** Baseline AUC > 0.5 (nomination count predicts winning). "
-                "If structural position matters, the full model's AUC should be higher. "
-                "Coefficient table reveals which centrality feature contributes most.\n\n"
-                "**Interpretation:** An AUC improvement means *who* nominates you carries "
-                "information beyond *how many*. A positive PageRank coefficient means being "
-                "nominated by influential nominators predicts winning."
+                "**What this measures:** At 5-year snapshots, computes structural features "
+                "for each nominee and predicts whether they win within 10 years. Compares "
+                "three logistic regression models via leave-one-snapshot-out CV:\n\n"
+                "1. **In-degree only** (baseline): just nomination count\n"
+                "2. **Structural**: breadth (unique nominators), diversity (Louvain "
+                "communities among nominators), reach (mean nominator degree), concentration "
+                "(Herfindahl index)\n"
+                "3. **Full**: in-degree + all structural features\n\n"
+                "**What to expect:** The structural model captures *who* nominates you, not "
+                "just *how many*. The full model should outperform both.\n\n"
+                "**Interpretation:** An AUC improvement from structural features means the "
+                "pattern of support (broad vs. narrow, diverse vs. concentrated) carries "
+                "information beyond raw popularity."
             )
         if flags.get("run_centrality"):
-            with st.spinner("Running centrality analysis (PageRank, betweenness, logistic regression)..."):
+            with st.spinner("Running centrality analysis (structural features, logistic regression)..."):
                 result = compute_centrality_prediction(cat_combined, precomputed)
 
             if "error" in result:
                 st.error(result["error"])
             else:
-                col1, col2, col3 = st.columns(3)
-                col1.metric("AUC (in-degree only)", f"{result['auc_baseline']:.3f}")
-                col2.metric("AUC (all centrality)", f"{result['auc_full']:.3f}")
-                col3.metric("Improvement", f"+{result['auc_improvement']:.3f}")
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("AUC (in-degree)", f"{result['auc_baseline']:.3f}")
+                col2.metric("AUC (structural)", f"{result.get('auc_structural', 0):.3f}")
+                col3.metric("AUC (full)", f"{result['auc_full']:.3f}")
+                col4.metric("Improvement", f"+{result['auc_improvement']:.3f}")
 
-                # ROC curve
+                # Three-curve ROC plot
                 roc = result["roc_data"]
                 fig, ax = plt.subplots(figsize=(6, 5))
-                ax.plot(roc["fpr_baseline"], roc["tpr_baseline"],
-                        color="#999999", linewidth=2,
-                        label=f"In-degree only (AUC={result['auc_baseline']:.3f})")
-                ax.plot(roc["fpr_full"], roc["tpr_full"],
-                        color="#d62728", linewidth=2,
-                        label=f"All centrality (AUC={result['auc_full']:.3f})")
+
+                # In-degree only (grey)
+                if "in_degree_only" in roc:
+                    auc_b = result["auc_baseline"]
+                    ax.plot(roc["in_degree_only"]["fpr"],
+                            roc["in_degree_only"]["tpr"],
+                            color="#999999", linewidth=2,
+                            label=f"In-degree only (AUC={auc_b:.3f})")
+                elif "fpr_baseline" in roc:
+                    # backward compat
+                    ax.plot(roc["fpr_baseline"], roc["tpr_baseline"],
+                            color="#999999", linewidth=2,
+                            label=f"In-degree only (AUC={result['auc_baseline']:.3f})")
+
+                # Structural (red)
+                if "structural" in roc:
+                    auc_s = result.get("auc_structural", 0)
+                    ax.plot(roc["structural"]["fpr"],
+                            roc["structural"]["tpr"],
+                            color="#d62728", linewidth=2,
+                            label=f"Structural (AUC={auc_s:.3f})")
+
+                # Full (blue)
+                if "full" in roc:
+                    auc_f = result["auc_full"]
+                    ax.plot(roc["full"]["fpr"],
+                            roc["full"]["tpr"],
+                            color="#1f77b4", linewidth=2,
+                            label=f"Full (AUC={auc_f:.3f})")
+                elif "fpr_full" in roc:
+                    ax.plot(roc["fpr_full"], roc["tpr_full"],
+                            color="#1f77b4", linewidth=2,
+                            label=f"Full (AUC={result['auc_full']:.3f})")
+
                 ax.plot([0, 1], [0, 1], color="black", linestyle="--", alpha=0.3)
                 ax.set_xlabel("False Positive Rate")
                 ax.set_ylabel("True Positive Rate")
@@ -2593,14 +3073,31 @@ def _render_advanced_analyses(combined_df, cat_combined, precomputed, flags):
                 _fig_download_buttons(fig, "centrality_roc", "centrality_roc")
                 plt.close(fig)
 
-                # Coefficient table
-                st.markdown("#### Feature Coefficients (Logistic Regression)")
-                coef_df = pd.DataFrame([
-                    {"Feature": k, "Coefficient": v}
-                    for k, v in sorted(result["coefficients"].items(),
-                                       key=lambda x: abs(x[1]), reverse=True)
-                ])
-                st.dataframe(coef_df, hide_index=True)
+                # Coefficient tables per model
+                model_results = result.get("model_results", {})
+                if model_results:
+                    st.markdown("#### Feature Coefficients by Model")
+                    for model_name, mres in model_results.items():
+                        label = model_name.replace("_", " ").title()
+                        coefs = mres.get("coefficients", {})
+                        if coefs:
+                            coef_df = pd.DataFrame([
+                                {"Feature": k, "Coefficient": v}
+                                for k, v in sorted(coefs.items(),
+                                                   key=lambda x: abs(x[1]),
+                                                   reverse=True)
+                            ])
+                            st.markdown(f"**{label}** (AUC = {mres['auc']:.3f})")
+                            st.dataframe(coef_df, hide_index=True)
+                else:
+                    # Backward compat: single coefficient table
+                    st.markdown("#### Feature Coefficients (Logistic Regression)")
+                    coef_df = pd.DataFrame([
+                        {"Feature": k, "Coefficient": v}
+                        for k, v in sorted(result["coefficients"].items(),
+                                           key=lambda x: abs(x[1]), reverse=True)
+                    ])
+                    st.dataframe(coef_df, hide_index=True)
 
                 st.caption(
                     "Positive coefficients indicate features that increase the "
