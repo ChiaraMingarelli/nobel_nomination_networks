@@ -18,12 +18,16 @@ import requests
 from bs4 import BeautifulSoup
 import pandas as pd
 import json
+import logging
 import time
 import re
 import os
+from datetime import datetime, timezone
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 from network_analysis import render_network_page
 
@@ -84,21 +88,62 @@ class NominationResult:
 # Scraping — Archive Access
 # ---------------------------------------------------------------------------
 
-def get_person_details(person_id: str) -> Optional[NominationResult]:
+def get_person_details(person_id: str, max_retries: int = 2) -> Optional[NominationResult]:
     """
     Fetch detailed nomination information for a person from the Nobel archive.
+
+    Retries transient network errors (ConnectionError, Timeout, 5xx) up to
+    max_retries times with exponential backoff. Parse errors are not retried.
 
     Parses the show_people.php page to extract:
     - Name, nomination counts
     - All nominations as nominee (category, year, nominator, nomination_id)
     - All nominations as nominator
     - Whether they won the prize
+
+    Returns NominationResult on success, None on failure. Logs exception type
+    on failure to distinguish server errors from parse failures.
     """
     url = f"{BASE_URL}show_people.php?id={person_id}"
 
+    last_exception = None
+    for attempt in range(max_retries + 1):
+        try:
+            response = requests.get(url, headers=HEADERS, timeout=30)
+            response.raise_for_status()
+            break  # success — proceed to parsing
+        except requests.exceptions.ConnectionError as e:
+            last_exception = e
+            logger.warning("Connection error for id=%s (attempt %d/%d): %s",
+                           person_id, attempt + 1, max_retries + 1, type(e).__name__)
+        except requests.exceptions.Timeout as e:
+            last_exception = e
+            logger.warning("Timeout for id=%s (attempt %d/%d)", person_id, attempt + 1, max_retries + 1)
+        except requests.exceptions.HTTPError as e:
+            if response.status_code >= 500:
+                last_exception = e
+                logger.warning("Server error %d for id=%s (attempt %d/%d)",
+                               response.status_code, person_id, attempt + 1, max_retries + 1)
+            else:
+                # 4xx errors are not transient — don't retry
+                logger.warning("HTTP %d for id=%s — not retrying", response.status_code, person_id)
+                return None
+        except requests.exceptions.RequestException as e:
+            last_exception = e
+            logger.warning("Request error for id=%s: %s", person_id, type(e).__name__)
+            return None
+
+        if attempt < max_retries:
+            backoff = 2 ** attempt  # 1s, 2s
+            time.sleep(backoff)
+    else:
+        # All retries exhausted
+        logger.error("Failed to fetch id=%s after %d attempts: %s",
+                     person_id, max_retries + 1, type(last_exception).__name__)
+        return None
+
+    # --- Parse the response (no retry on parse errors) ---
     try:
-        response = requests.get(url, headers=HEADERS, timeout=30)
-        response.raise_for_status()
         soup = BeautifulSoup(response.text, "html.parser")
         page_text = soup.get_text()
 
@@ -200,7 +245,8 @@ def get_person_details(person_id: str) -> Optional[NominationResult]:
             prize_info=prize_info,
         )
 
-    except Exception:
+    except Exception as e:
+        logger.error("Parse error for id=%s: %s: %s", person_id, type(e).__name__, e)
         return None
 
 
@@ -251,23 +297,29 @@ def collect_nominee_ids(category: str, year_from: int, year_to: int) -> dict:
     return results
 
 
-def collect_nomination_edges(person_ids: dict, category: str) -> pd.DataFrame:
+def collect_nomination_edges(person_ids: dict, category: str) -> tuple[pd.DataFrame, list[str]]:
     """
     For each person ID, call get_person_details() and extract
     nominations_as_nominee entries into rows.
 
-    Returns DataFrame with columns:
+    Returns (DataFrame, failed_ids) where failed_ids lists person IDs that
+    could not be fetched after retries.
+
+    DataFrame columns:
         nomination_id, year, category, nominee_name, nominee_id, nominator_name
     """
     rows = []
     seen_edges = set()  # (nomination_id, nominee_id) — same nomination can cover multiple nominees
+    failed_ids = []
 
     progress = st.progress(0, text="Collecting nomination edges...")
     total = len(person_ids)
 
     for i, (pid, name) in enumerate(person_ids.items()):
         result = get_person_details(pid)
-        if result and result.nominations_as_nominee:
+        if result is None:
+            failed_ids.append(pid)
+        elif result.nominations_as_nominee:
             for entry in result.nominations_as_nominee:
                 edge_key = (entry.nomination_id, pid)
                 if edge_key in seen_edges:
@@ -282,14 +334,16 @@ def collect_nomination_edges(person_ids: dict, category: str) -> pd.DataFrame:
                     "nominator_name": entry.other_party,
                 })
 
+        n_failed = len(failed_ids)
+        fail_text = f", {n_failed} failed" if n_failed > 0 else ""
         progress.progress(
             (i + 1) / total,
-            text=f"Fetching details {i + 1}/{total}: {name[:30]}... ({len(rows)} edges)",
+            text=f"Fetching details {i + 1}/{total}: {name[:30]}... ({len(rows)} edges{fail_text})",
         )
         time.sleep(0.15)
 
     progress.empty()
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows), failed_ids
 
 
 @st.cache_data
@@ -386,25 +440,51 @@ def cache_filename(category: str) -> Path:
 
 
 @st.cache_data
-def load_cached_edges(category: str) -> pd.DataFrame | None:
-    """Load cached edge data if available."""
+def load_cached_edges(category: str) -> tuple[pd.DataFrame | None, dict]:
+    """
+    Load cached edge data if available.
+
+    Returns (DataFrame_or_None, metadata) where metadata contains:
+      - year_from, year_to: the year range that was scraped
+      - scraped_at: ISO timestamp of when the scrape ran
+    If the cache file is in the old format (bare list), metadata will be empty.
+    """
     path = cache_filename(category)
     if path.exists():
         try:
             with open(path, "r") as f:
-                data = json.load(f)
-            return pd.DataFrame(data)
+                raw = json.load(f)
+            # New format: {"metadata": {...}, "data": [...]}
+            if isinstance(raw, dict) and "data" in raw:
+                metadata = raw.get("metadata", {})
+                return pd.DataFrame(raw["data"]), metadata
+            # Old format: bare list of records
+            if isinstance(raw, list):
+                return pd.DataFrame(raw), {}
         except Exception:
-            return None
-    return None
+            return None, {}
+    return None, {}
 
 
-def save_cached_edges(category: str, df: pd.DataFrame):
-    """Save edge data to cache."""
+def save_cached_edges(category: str, df: pd.DataFrame,
+                      year_from: int | None = None, year_to: int | None = None):
+    """
+    Save edge data to cache with metadata about the scraped year range.
+
+    Format: {"metadata": {"year_from": ..., "year_to": ..., "scraped_at": ...}, "data": [...]}
+    """
     DATA_DIR.mkdir(exist_ok=True)
     path = cache_filename(category)
+    payload = {
+        "metadata": {
+            "year_from": year_from,
+            "year_to": year_to,
+            "scraped_at": datetime.now(timezone.utc).isoformat(),
+        },
+        "data": df.to_dict(orient="records"),
+    }
     with open(path, "w") as f:
-        json.dump(df.to_dict(orient="records"), f, indent=2)
+        json.dump(payload, f, indent=2)
 
 
 @st.cache_data
@@ -412,7 +492,7 @@ def load_all_cached_edges() -> pd.DataFrame:
     """Load all 5 category caches, concatenate, and deduplicate."""
     frames = []
     for category in CATEGORY_TO_PRIZE:
-        cat_df = load_cached_edges(category)
+        cat_df, _meta = load_cached_edges(category)
         if cat_df is not None:
             frames.append(cat_df)
     if not frames:
@@ -465,10 +545,21 @@ def main():
     year_range = (year_from, year_to)
 
     # Check for cached data
-    cached_df = load_cached_edges(category)
+    cached_df, cache_meta = load_cached_edges(category)
     has_cache = cached_df is not None
 
     if has_cache:
+        # Check cache coverage and warn if the selected range extends beyond
+        cached_from = cache_meta.get("year_from")
+        cached_to = cache_meta.get("year_to")
+        if cached_from is not None and cached_to is not None:
+            if year_range[0] < cached_from or year_range[1] > cached_to:
+                st.sidebar.warning(
+                    f"Cache covers {cached_from}–{cached_to}. "
+                    f"Selected range {year_range[0]}–{year_range[1]} extends "
+                    f"beyond cached data. Rebuild to fill the gap."
+                )
+
         # Filter cached data to selected category and year range
         df = cached_df[
             (cached_df["category"] == category)
@@ -520,8 +611,13 @@ def _build_data(category: str, year_from: int, year_to: int, precomputed: dict):
         st.write(f"Found {len(person_ids)} unique people.")
 
         st.write("Step 2/3: Fetching nomination details for each person...")
-        df = collect_nomination_edges(person_ids, category)
+        df, failed_ids = collect_nomination_edges(person_ids, category)
         st.write(f"Collected {len(df)} nomination edges.")
+        if failed_ids:
+            st.warning(
+                f"{len(failed_ids)} people could not be fetched after retries: "
+                f"{', '.join(failed_ids[:10])}{'...' if len(failed_ids) > 10 else ''}"
+            )
 
         st.write("Step 3/3: Enriching with country data...")
         df = enrich_with_country(df, precomputed)
@@ -533,7 +629,7 @@ def _build_data(category: str, year_from: int, year_to: int, precomputed: dict):
         st.write(f"Country data: {known}/{len(df)} nominees matched.")
 
         # Save full dataset for future use
-        save_cached_edges(category, df)
+        save_cached_edges(category, df, year_from, year_to)
         status.update(label=f"Done! {len(df)} edges cached.", state="complete")
 
 

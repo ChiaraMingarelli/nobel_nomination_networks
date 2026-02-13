@@ -379,8 +379,199 @@ def _cached_visualize(graph_key, _G, title, min_edge_weight, color_by):
 
 
 def _df_hash(df):
-    """Fast deterministic hash for a DataFrame."""
-    return hash((len(df), tuple(df.columns), pd.util.hash_pandas_object(df).sum()))
+    """Deterministic hash for a DataFrame using hashlib to avoid collisions."""
+    import hashlib
+    h = hashlib.sha256()
+    h.update(str(len(df)).encode())
+    h.update(",".join(df.columns).encode())
+    h.update(pd.util.hash_pandas_object(df).values.tobytes())
+    return h.hexdigest()
+
+
+def _render_graph_visualization(G, network_type, min_weight, is_cross_category):
+    """Render the interactive PyVis graph and stats/legend below it."""
+    if G.number_of_nodes() == 0:
+        st.info("No data to display for current filters.")
+        return
+
+    color_mode = "category" if is_cross_category else "country"
+    graph_key = (G.number_of_nodes(), G.number_of_edges(), network_type, min_weight, color_mode)
+    html_content = _cached_visualize(graph_key, G, network_type, min_weight, color_mode)
+    if html_content:
+        st.components.v1.html(html_content, height=720, scrolling=True)
+    else:
+        st.info("No edges meet the current filter criteria.")
+
+    # Network stats
+    stats, name_stats = network_summary(G)
+    cols = st.columns(len(stats))
+    for i, (k, v) in enumerate(stats.items()):
+        cols[i].metric(k, v)
+    if name_stats:
+        for label, name in name_stats.items():
+            st.markdown(f"**{label}:** {name}")
+
+    # Description
+    if network_type == "Nominator -> Nominee":
+        st.markdown(
+            "**Directed graph**: arrows point from nominator to nominee. "
+            "Node size = total nominations received. "
+            "Edge thickness = number of times that nominator proposed that nominee. "
+            "Hover over nodes and edges for details."
+        )
+    elif network_type == "Co-nomination (shared nominators)":
+        st.markdown(
+            "**Undirected graph**: nominees are linked when they share nominators. "
+            "Node size = total nominations received. "
+            "Edge thickness = number of shared nominators. "
+            "Clusters reveal communities of nominees championed by the same people."
+        )
+    elif is_cross_category:
+        st.markdown(
+            "**Undirected graph**: all 5 Nobel categories combined. "
+            "Nominator-nominee pairs are linked. "
+            "Node color = discipline. Gold border = laureate. "
+            "Hover over nodes for details."
+        )
+
+    # Color legend
+    if is_cross_category:
+        categories_in_graph = set()
+        for node in G.nodes:
+            c = G.nodes[node].get("category", "")
+            if c:
+                categories_in_graph.add(c)
+        legend_items = []
+        for cat in sorted(categories_in_graph):
+            color = DISCIPLINE_COLORS.get(cat, "#999999")
+            legend_items.append(
+                f'<span style="color:{color}; font-size:20px;">&#9679;</span> {cat}'
+            )
+        legend_items.append(
+            '<span style="color:#FFD700; font-size:20px;">&#9679;</span> Laureate (gold border)'
+        )
+        st.markdown(
+            "**Node color = discipline:** " + " &nbsp;&nbsp; ".join(legend_items),
+            unsafe_allow_html=True,
+        )
+    else:
+        countries_in_graph = set()
+        for node in G.nodes:
+            c = G.nodes[node].get("country", "Unknown")
+            if c:
+                countries_in_graph.add(c)
+        legend_items = []
+        for country in sorted(countries_in_graph):
+            color = COUNTRY_COLORS.get(country, "#cccccc")
+            legend_items.append(
+                f'<span style="color:{color}; font-size:20px;">&#9679;</span> {country}'
+            )
+        if legend_items:
+            st.markdown(
+                "**Node color = country:** " + " &nbsp;&nbsp; ".join(legend_items),
+                unsafe_allow_html=True,
+            )
+
+    # Community detection (co-nomination only)
+    if network_type == "Co-nomination (shared nominators)":
+        if st.checkbox("Run community detection (Louvain)"):
+            try:
+                from networkx.algorithms.community import louvain_communities
+                communities = louvain_communities(G, weight="weight", seed=42)
+                for i, comm in enumerate(sorted(communities, key=len, reverse=True)[:10]):
+                    st.write(f"**Community {i+1}** ({len(comm)} members): {', '.join(sorted(comm)[:10])}{'...' if len(comm) > 10 else ''}")
+            except ImportError:
+                st.warning("Louvain requires networkx >= 2.8")
+
+
+def _render_campaigns(df, min_noms, campaign_window):
+    """Render campaign detection results."""
+    st.subheader("Campaign Detection")
+    campaigns = detect_campaigns(df, min_nominations=min_noms, year_window=campaign_window)
+    if len(campaigns) > 0:
+        display_cols = ["nominee", "year_start", "year_end",
+                        "n_nominations", "n_unique_nominators"]
+        st.dataframe(campaigns[display_cols], hide_index=True)
+        _csv_download_button(
+            campaigns[display_cols],
+            "campaigns.csv", key="campaigns_csv",
+        )
+    else:
+        st.info("No campaigns detected with current thresholds.")
+
+
+def _render_paper_analyses(df, combined_df, precomputed, has_combined, run_lcc):
+    """Render the Gallotti & De Domenico paper analyses (endorsement + LCC)."""
+    import matplotlib.pyplot as plt
+
+    st.subheader("Paper Analyses (Gallotti & De Domenico, 2019)")
+    st.caption(
+        "Inspired by *Effects of homophily and academic reputation "
+        "in the nomination and selection of Nobel laureates*."
+    )
+
+    # --- Endorsement Effect ---
+    st.markdown("#### Laureate Endorsement Effect")
+    st.caption("Do nominees endorsed by past laureates win at higher rates?")
+    analysis_df = combined_df if has_combined else df
+    effect = compute_endorsement_effect(analysis_df, precomputed)
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric(
+        "Endorsed win rate",
+        f"{effect['endorsed_rate']:.1%}",
+        help=f"{effect['endorsed_won']}/{effect['endorsed_total']} nominees endorsed by a past laureate went on to win",
+    )
+    col2.metric(
+        "Non-endorsed win rate",
+        f"{effect['not_endorsed_rate']:.1%}",
+        help=f"{effect['not_endorsed_won']}/{effect['not_endorsed_total']} nominees without laureate endorsement went on to win",
+    )
+    ratio_str = f"{effect['ratio']:.1f}x" if effect['ratio'] != float("inf") else "N/A"
+    col3.metric("Ratio", ratio_str)
+
+    fig, ax = plt.subplots(figsize=(5, 3))
+    bars = ax.bar(
+        ["Endorsed\nby laureate", "Not endorsed"],
+        [effect["endorsed_rate"] * 100, effect["not_endorsed_rate"] * 100],
+        color=["#FFD700", "#999999"],
+        edgecolor="black",
+    )
+    ax.set_ylabel("Win rate (%)")
+    ax.set_title("Laureate endorsement effect")
+    max_val = max(effect["endorsed_rate"], effect["not_endorsed_rate"]) * 100
+    ax.set_ylim(0, max_val * 1.2)
+    for bar, rate in zip(bars, [effect["endorsed_rate"], effect["not_endorsed_rate"]]):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
+                f"{rate:.1%}", ha="center", va="bottom", fontsize=10)
+    fig.tight_layout()
+    st.pyplot(fig)
+    _fig_download_buttons(fig, "endorsement_effect", "endorsement")
+    plt.close(fig)
+
+    # --- Laureates in LCC (results in sidebar) ---
+    if run_lcc:
+        with st.sidebar:
+            with st.spinner("Running LCC permutation test..."):
+                if has_combined:
+                    G_combined = build_combined_nomination_graph(combined_df, precomputed)
+                else:
+                    G_combined = build_combined_nomination_graph(df, precomputed)
+                lcc_result = compute_lcc_analysis(G_combined, precomputed)
+
+            if "error" in lcc_result:
+                st.error(lcc_result["error"])
+            else:
+                st.markdown("**LCC Results**")
+                st.metric("Observed in LCC", lcc_result["observed"],
+                          help=f"Out of {lcc_result['n_laureates']} laureates")
+                st.metric("Expected (null)", f"{lcc_result['expected_mean']} +/- {lcc_result['expected_std']}")
+                st.metric("Z-score", lcc_result["z_score"],
+                          help=f"p = {lcc_result['p_value']:.2e}")
+                st.caption(
+                    f"LCC: {lcc_result['lcc_size']}/{lcc_result['graph_size']} nodes. "
+                    f"Laureates: {lcc_result['n_laureates']}."
+                )
 
 
 def render_network_page(df: pd.DataFrame, precomputed: dict | None = None,
@@ -388,6 +579,10 @@ def render_network_page(df: pd.DataFrame, precomputed: dict | None = None,
     """
     Full Streamlit page for network analysis.
     Category and year range are already filtered by the caller (sidebar).
+
+    Delegates to helper functions for each section:
+      _render_graph_visualization, _render_campaigns,
+      _render_paper_analyses, _render_advanced_analyses
     """
     if not HAS_STREAMLIT:
         print("Streamlit not available. Use this module within a Streamlit app.")
@@ -396,7 +591,7 @@ def render_network_page(df: pd.DataFrame, precomputed: dict | None = None,
     has_combined = combined_df is not None and not combined_df.empty
     has_precomputed = precomputed is not None and len(precomputed) > 0
 
-    # --- Sidebar filters (below the data selection controls) ---
+    # --- Sidebar: Network Controls ---
     st.sidebar.divider()
     st.sidebar.header("Network Controls")
 
@@ -408,10 +603,8 @@ def render_network_page(df: pd.DataFrame, precomputed: dict | None = None,
         network_options.append("Cross-category Combined")
 
     network_type = st.sidebar.selectbox("Network type", network_options)
-
     is_cross_category = network_type == "Cross-category Combined"
 
-    # Default min_weight for cross-category (too many nodes at 1)
     default_weight = 2 if is_cross_category else 1
     min_weight = st.sidebar.slider("Min edge weight", 1, 10, default_weight)
 
@@ -426,113 +619,6 @@ def render_network_page(df: pd.DataFrame, precomputed: dict | None = None,
         country_filter = st.sidebar.selectbox("Filter nominee country", country_options)
         if country_filter == "All":
             country_filter = None
-
-    # --- Main area ---
-    st.header("Nomination Networks")
-
-    # Build the appropriate graph (cached)
-    if network_type == "Nominator -> Nominee":
-        G = _cached_build_graph(_df_hash(df), df, network_type, country_filter, None)
-    elif network_type == "Co-nomination (shared nominators)":
-        G = _cached_build_graph(_df_hash(df), df, network_type, None, None)
-    elif is_cross_category:
-        with st.spinner("Building cross-category combined network..."):
-            G = _cached_build_graph(_df_hash(combined_df), combined_df, network_type, None, precomputed)
-
-    # Render interactive visualization (cached)
-    if G.number_of_nodes() > 0:
-        color_mode = "category" if is_cross_category else "country"
-        graph_key = (G.number_of_nodes(), G.number_of_edges(), network_type, min_weight, color_mode)
-        html_content = _cached_visualize(graph_key, G, network_type, min_weight, color_mode)
-        if html_content:
-            st.components.v1.html(html_content, height=720, scrolling=True)
-        else:
-            st.info("No edges meet the current filter criteria.")
-    else:
-        st.info("No data to display for current filters.")
-
-    # --- Everything below the figure ---
-    if G.number_of_nodes() > 0:
-        # Network stats
-        stats, name_stats = network_summary(G)
-        cols = st.columns(len(stats))
-        for i, (k, v) in enumerate(stats.items()):
-            cols[i].metric(k, v)
-        if name_stats:
-            for label, name in name_stats.items():
-                st.markdown(f"**{label}:** {name}")
-
-        # Description
-        if network_type == "Nominator -> Nominee":
-            st.markdown(
-                "**Directed graph**: arrows point from nominator to nominee. "
-                "Node size = total nominations received. "
-                "Edge thickness = number of times that nominator proposed that nominee. "
-                "Hover over nodes and edges for details."
-            )
-        elif network_type == "Co-nomination (shared nominators)":
-            st.markdown(
-                "**Undirected graph**: nominees are linked when they share nominators. "
-                "Node size = total nominations received. "
-                "Edge thickness = number of shared nominators. "
-                "Clusters reveal communities of nominees championed by the same people."
-            )
-        elif is_cross_category:
-            st.markdown(
-                "**Undirected graph**: all 5 Nobel categories combined. "
-                "Nominator-nominee pairs are linked. "
-                "Node color = discipline. Gold border = laureate. "
-                "Hover over nodes for details."
-            )
-
-        # Color legend
-        if is_cross_category:
-            categories_in_graph = set()
-            for node in G.nodes:
-                c = G.nodes[node].get("category", "")
-                if c:
-                    categories_in_graph.add(c)
-            legend_items = []
-            for cat in sorted(categories_in_graph):
-                color = DISCIPLINE_COLORS.get(cat, "#999999")
-                legend_items.append(
-                    f'<span style="color:{color}; font-size:20px;">&#9679;</span> {cat}'
-                )
-            legend_items.append(
-                '<span style="color:#FFD700; font-size:20px;">&#9679;</span> Laureate (gold border)'
-            )
-            st.markdown(
-                "**Node color = discipline:** " + " &nbsp;&nbsp; ".join(legend_items),
-                unsafe_allow_html=True,
-            )
-        else:
-            countries_in_graph = set()
-            for node in G.nodes:
-                c = G.nodes[node].get("country", "Unknown")
-                if c:
-                    countries_in_graph.add(c)
-            legend_items = []
-            for country in sorted(countries_in_graph):
-                color = COUNTRY_COLORS.get(country, "#cccccc")
-                legend_items.append(
-                    f'<span style="color:{color}; font-size:20px;">&#9679;</span> {country}'
-                )
-            if legend_items:
-                st.markdown(
-                    "**Node color = country:** " + " &nbsp;&nbsp; ".join(legend_items),
-                    unsafe_allow_html=True,
-                )
-
-        # Community detection (co-nomination only)
-        if network_type == "Co-nomination (shared nominators)":
-            if st.checkbox("Run community detection (Louvain)"):
-                try:
-                    from networkx.algorithms.community import louvain_communities
-                    communities = louvain_communities(G, weight="weight", seed=42)
-                    for i, comm in enumerate(sorted(communities, key=len, reverse=True)[:10]):
-                        st.write(f"**Community {i+1}** ({len(comm)} members): {', '.join(sorted(comm)[:10])}{'...' if len(comm) > 10 else ''}")
-                except ImportError:
-                    st.warning("Louvain requires networkx >= 2.8")
 
     # --- Sidebar: Analysis options ---
     st.sidebar.divider()
@@ -553,7 +639,7 @@ def render_network_page(df: pd.DataFrame, precomputed: dict | None = None,
         run_lcc = st.sidebar.button("Run LCC Analysis", key="lcc_btn")
     show_raw = st.sidebar.checkbox("Raw Edge Data", key="show_raw")
 
-    # --- Advanced Analyses ---
+    # --- Sidebar: Advanced Analyses ---
     st.sidebar.divider()
     st.sidebar.header("Advanced Analyses")
 
@@ -575,10 +661,7 @@ def render_network_page(df: pd.DataFrame, precomputed: dict | None = None,
     show_temporal = adv_selection == "Temporal Evolution"
     show_proximity = adv_selection == "Three Degrees of Influence"
 
-    run_centrality = False
-    run_near_miss = False
-    run_temporal = False
-    run_proximity = False
+    run_centrality = run_near_miss = run_temporal = run_proximity = False
     near_miss_min = 10
 
     if show_centrality:
@@ -591,99 +674,31 @@ def render_network_page(df: pd.DataFrame, precomputed: dict | None = None,
     elif show_proximity:
         run_proximity = st.sidebar.button("Run Proximity Analysis", key="proximity_btn")
 
-    # --- Main area: render selected analyses ---
+    # --- Main area: Graph visualization ---
+    st.header("Nomination Networks")
 
+    if network_type == "Nominator -> Nominee":
+        G = _cached_build_graph(_df_hash(df), df, network_type, country_filter, None)
+    elif network_type == "Co-nomination (shared nominators)":
+        G = _cached_build_graph(_df_hash(df), df, network_type, None, None)
+    elif is_cross_category:
+        with st.spinner("Building cross-category combined network..."):
+            G = _cached_build_graph(_df_hash(combined_df), combined_df, network_type, None, precomputed)
+
+    _render_graph_visualization(G, network_type, min_weight, is_cross_category)
+
+    # --- Main area: Analyses ---
     if show_campaigns and run_campaigns:
-        st.subheader("Campaign Detection")
-        campaigns = detect_campaigns(df, min_nominations=min_noms, year_window=campaign_window)
-        if len(campaigns) > 0:
-            display_cols = ["nominee", "year_start", "year_end",
-                            "n_nominations", "n_unique_nominators"]
-            st.dataframe(campaigns[display_cols], hide_index=True)
-            _csv_download_button(
-                campaigns[display_cols],
-                "campaigns.csv", key="campaigns_csv",
-            )
-        else:
-            st.info("No campaigns detected with current thresholds.")
+        _render_campaigns(df, min_noms, campaign_window)
 
     if show_paper:
-        st.subheader("Paper Analyses (Gallotti & De Domenico, 2019)")
-        st.caption(
-            "Inspired by *Effects of homophily and academic reputation "
-            "in the nomination and selection of Nobel laureates*."
-        )
-
-        # --- Endorsement Effect ---
-        st.markdown("#### Laureate Endorsement Effect")
-        st.caption("Do nominees endorsed by past laureates win at higher rates?")
-        analysis_df = combined_df if has_combined else df
-        effect = compute_endorsement_effect(analysis_df, precomputed)
-
-        col1, col2, col3 = st.columns(3)
-        col1.metric(
-            "Endorsed win rate",
-            f"{effect['endorsed_rate']:.1%}",
-            help=f"{effect['endorsed_won']}/{effect['endorsed_total']} nominees endorsed by a past laureate went on to win",
-        )
-        col2.metric(
-            "Non-endorsed win rate",
-            f"{effect['not_endorsed_rate']:.1%}",
-            help=f"{effect['not_endorsed_won']}/{effect['not_endorsed_total']} nominees without laureate endorsement went on to win",
-        )
-        ratio_str = f"{effect['ratio']:.1f}x" if effect['ratio'] != float("inf") else "N/A"
-        col3.metric("Ratio", ratio_str)
-
-        import matplotlib.pyplot as plt
-        fig, ax = plt.subplots(figsize=(5, 3))
-        bars = ax.bar(
-            ["Endorsed\nby laureate", "Not endorsed"],
-            [effect["endorsed_rate"] * 100, effect["not_endorsed_rate"] * 100],
-            color=["#FFD700", "#999999"],
-            edgecolor="black",
-        )
-        ax.set_ylabel("Win rate (%)")
-        ax.set_title("Laureate endorsement effect")
-        max_val = max(effect["endorsed_rate"], effect["not_endorsed_rate"]) * 100
-        ax.set_ylim(0, max_val * 1.2)
-        for bar, rate in zip(bars, [effect["endorsed_rate"], effect["not_endorsed_rate"]]):
-            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
-                    f"{rate:.1%}", ha="center", va="bottom", fontsize=10)
-        fig.tight_layout()
-        st.pyplot(fig)
-        _fig_download_buttons(fig, "endorsement_effect", "endorsement")
-        plt.close(fig)
-
-        # --- Laureates in LCC (results in sidebar) ---
-        if run_lcc:
-            with st.sidebar:
-                with st.spinner("Running LCC permutation test..."):
-                    if has_combined:
-                        G_combined = build_combined_nomination_graph(combined_df, precomputed)
-                    else:
-                        G_combined = build_combined_nomination_graph(df, precomputed)
-                    lcc_result = compute_lcc_analysis(G_combined, precomputed)
-
-                if "error" in lcc_result:
-                    st.error(lcc_result["error"])
-                else:
-                    st.markdown("**LCC Results**")
-                    st.metric("Observed in LCC", lcc_result["observed"],
-                              help=f"Out of {lcc_result['n_laureates']} laureates")
-                    st.metric("Expected (null)", f"{lcc_result['expected_mean']} +/- {lcc_result['expected_std']}")
-                    st.metric("Z-score", lcc_result["z_score"],
-                              help=f"p = {lcc_result['p_value']:.2e}")
-                    st.caption(
-                        f"LCC: {lcc_result['lcc_size']}/{lcc_result['graph_size']} nodes. "
-                        f"Laureates: {lcc_result['n_laureates']}."
-                    )
+        _render_paper_analyses(df, combined_df, precomputed, has_combined, run_lcc)
 
     if show_raw:
         st.subheader("Raw Edge Data")
         st.dataframe(df, hide_index=True)
         _csv_download_button(df, "nomination_edges.csv", key="raw_edges_csv")
 
-    # --- Advanced Analyses ---
     if has_combined and adv_selection != "None":
         adv_flags = {
             "show_centrality": show_centrality,
